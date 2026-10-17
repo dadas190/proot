@@ -26,6 +26,7 @@
 #include <errno.h>		/* errno(3), E* */
 
 #include "syscall/syscall.h"
+#include "syscall/notify.h"
 #include "syscall/chain.h"
 #include "extension/extension.h"
 #include "tracee/tracee.h"
@@ -173,6 +174,9 @@ void translate_syscall(Tracee *tracee)
     }
 
     (void) push_regs(tracee);
+
+    if (is_enter_stage)
+	notify_record_translation(tracee);
 
     if (is_enter_stage)
 	print_current_regs(tracee, 5, "sysenter end");

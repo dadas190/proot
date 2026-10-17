@@ -348,6 +348,23 @@ Tracee *get_tracee(const Tracee *current_tracee, pid_t pid, bool create)
 }
 
 /**
+ * Return the entry related to the living tracee @pid, or NULL if
+ * there's no such entry.  Unlike get_tracee(), its memory collector
+ * is left as-is.
+ */
+Tracee *get_tracee_noreset(pid_t pid)
+{
+    Tracee *tracee;
+
+    LIST_FOREACH(tracee, &tracees, link) {
+	if (tracee->pid == pid && !tracee->terminated)
+	    return tracee;
+    }
+
+    return NULL;
+}
+
+/**
  * Mark tracee as terminated and optionally take action.
  */
 void terminate_tracee(Tracee *tracee)

@@ -26,6 +26,8 @@
 #if defined(HAVE_SECCOMP_FILTER)
 
 #include <sys/prctl.h>		/* prctl(2), PR_* */
+#include <sys/syscall.h>	/* SYS_seccomp, */
+#include <unistd.h>		/* syscall(2), */
 #include <linux/filter.h>	/* struct sock_*, */
 #include <linux/seccomp.h>	/* SECCOMP_MODE_FILTER, */
 #include <linux/filter.h>	/* struct sock_*, */
@@ -40,6 +42,7 @@
 #include <assert.h>		/* assert(3), */
 
 #include "syscall/seccomp.h"
+#include "syscall/notify.h"
 #include "tracee/tracee.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
@@ -94,11 +97,12 @@ static int add_statements(struct sock_fprog *program, size_t nb_statements,
 
 /**
  * Append to @program->filter the statements required to notify PRoot
- * about the given @syscall made by a tracee, with the given @flag.
- * This function returns -errno if an error occurred, otherwise 0.
+ * about the given @syscall made by a tracee, with the given @action:
+ * SECCOMP_RET_TRACE plus a flag, or SECCOMP_RET_USER_NOTIF.  This
+ * function returns -errno if an error occurred, otherwise 0.
  */
 static int add_trace_syscall(struct sock_fprog *program, word_t syscall,
-			     int flag)
+			     uint32_t action)
 {
     int status;
 
@@ -113,7 +117,7 @@ static int add_trace_syscall(struct sock_fprog *program, word_t syscall,
 	BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, 1),
 
 	/* Notify the tracer.  */
-	BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE + flag)
+	BPF_STMT(BPF_RET + BPF_K, action)
     };
 
     DEBUG_FILTER("FILTER:     trace if syscall == %ld\n", syscall);
@@ -242,6 +246,37 @@ static void free_program_filter(struct sock_fprog *program)
     program->len = 0;
 }
 
+#if defined(NOTIFY_SUPPORTED)
+#if !defined(SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV)
+#define SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV (1UL << 5)
+#endif
+
+/**
+ * Enable the filter @program and put in @listener the file descriptor
+ * its notifications are reported to.  This function returns -errno
+ * if an error occurred, otherwise 0.
+ */
+static int install_with_listener(struct sock_fprog *program, int *listener)
+{
+    long status;
+
+    /* Since Linux 5.19, a tracee waiting for its notification to be
+     * answered can only be interrupted by a fatal signal, so a
+     * syscall performed by a worker is never restarted.  */
+    status = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+		     SECCOMP_FILTER_FLAG_NEW_LISTENER
+		     | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, program);
+    if (status < 0 && errno == EINVAL)
+	status = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+			 SECCOMP_FILTER_FLAG_NEW_LISTENER, program);
+    if (status < 0)
+	return -errno;
+
+    *listener = (int) status;
+    return 0;
+}
+#endif
+
 /**
  * Convert the given @sysnums into BPF filters according to the
  * following pseudo-code, then enabled them for the given @tracee and
@@ -249,13 +284,15 @@ static void free_program_filter(struct sock_fprog *program)
  *
  *     for each handled architectures
  *         for each filtered syscall
- *             trace
+ *             trace (or notify, see notify.c)
  *         allow
  *     kill
  *
- * This function returns -errno if an error occurred, otherwise 0.
+ * Syscalls are reported through a notification file descriptor, put
+ * in @listener, only if @listener is not NULL.  This function returns
+ * -errno if an error occurred, otherwise 0.
  */
-static int set_seccomp_filters(const FilteredSysnum *sysnums)
+static int set_seccomp_filters(const FilteredSysnum *sysnums, int *listener)
 {
     SeccompArch seccomp_archs[] = SECCOMP_ARCHS;
     size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
@@ -302,9 +339,21 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 		if (syscall == SYSCALL_AVOIDER)
 		    continue;
 
-		/* Filter: trace if handled syscall */
-		status =
-		    add_trace_syscall(&program, syscall, sysnums[k].flags);
+		/* Filter: trace if handled syscall, or notify the
+		 * workers if they serve it for the native ABI.  */
+#if defined(NOTIFY_SUPPORTED)
+		if (listener != NULL && i == 0
+		    && seccomp_archs[i].abis[j] == ABI_DEFAULT
+		    && notify_is_routed(sysnums[k].value))
+		    status =
+			add_trace_syscall(&program, syscall,
+					  SECCOMP_RET_USER_NOTIF);
+		else
+#endif
+		    status =
+			add_trace_syscall(&program, syscall,
+					  SECCOMP_RET_TRACE +
+					  sysnums[k].flags);
 		if (status < 0)
 		    goto end;
 	    }
@@ -328,6 +377,13 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
      *
      *     write(2, program.filter, program.len * sizeof(struct sock_filter));
      */
+
+#if defined(NOTIFY_SUPPORTED)
+    if (listener != NULL) {
+	status = install_with_listener(&program, listener);
+	goto end;
+    }
+#endif
 
     status = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
     if (status < 0)
@@ -480,10 +536,12 @@ static int merge_filtered_sysnums(TALLOC_CTX *context,
 /**
  * Tell the kernel to trace only syscalls handled by PRoot and its
  * extensions.  This filter will be enabled for the given @tracee and
- * all of its future children.  This function returns -errno if an
- * error occurred, otherwise 0.
+ * all of its future children.  If @listener is not NULL, some
+ * syscalls are reported through a notification file descriptor put
+ * in @listener (-1 if the kernel can't do that).  This function
+ * returns -errno if an error occurred, otherwise 0.
  */
-int enable_syscall_filtering(const Tracee *tracee)
+int enable_syscall_filtering(const Tracee *tracee, int *listener)
 {
     FilteredSysnum *filtered_sysnums = NULL;
     Extension *extension;
@@ -515,7 +573,19 @@ int enable_syscall_filtering(const Tracee *tracee)
 	}
     }
 
-    status = set_seccomp_filters(filtered_sysnums);
+    if (listener != NULL) {
+	*listener = -1;
+
+	/* Fall back to the ptrace flow for all syscalls, eg. when
+	 * another filter has a listener already (EBUSY).  */
+	status = set_seccomp_filters(filtered_sysnums, listener);
+	if (status >= 0)
+	    return 0;
+
+	*listener = -1;
+    }
+
+    status = set_seccomp_filters(filtered_sysnums, NULL);
     if (status < 0)
 	return status;
 
@@ -527,8 +597,10 @@ int enable_syscall_filtering(const Tracee *tracee)
 #include "tracee/tracee.h"
 #include "attribute.h"
 
-int enable_syscall_filtering(const Tracee *tracee UNUSED)
+int enable_syscall_filtering(const Tracee *tracee UNUSED, int *listener)
 {
+    if (listener != NULL)
+	*listener = -1;
     return 0;
 }
 

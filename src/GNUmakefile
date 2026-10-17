@@ -58,6 +58,7 @@ endif
 
 CFLAGS   += $(shell ${PKG_CONFIG} --cflags talloc)
 LDFLAGS  += -Wl,-z,noexecstack
+LDFLAGS  += -pthread
 LDFLAGS  += $(shell ${PKG_CONFIG} --libs talloc)
 
 ifneq ($(findstring -static,$(LDFLAGS)),)
@@ -86,6 +87,7 @@ OBJECTS += \
 	path/proc.o		\
 	path/temp.o		\
 	syscall/seccomp.o	\
+	syscall/notify.o	\
 	syscall/syscall.o	\
 	syscall/chain.o		\
 	syscall/enter.o		\

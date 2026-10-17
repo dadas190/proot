@@ -225,6 +225,15 @@ typedef struct tracee {
     /* Ensure the sysexit stage is always hit under seccomp.  */
     bool sysexit_pending;
 
+    /* Arguments of the last syscall translated at a ptrace stop that
+     * the seccomp filter reports to the notification workers
+     * afterwards, see notify_record_translation().  */
+    struct {
+	bool valid;
+	word_t sysnum;
+	word_t args[6];
+    } notify;
+
     /* The no_new_privs flag as this tracee sees it: inherited from
      * PRoot's caller, or set by the program itself.  The kernel's
      * flag doesn't tell, since PRoot sets it to install its seccomp
@@ -297,6 +306,7 @@ typedef struct tracee {
 #define TRACEE(a) talloc_get_type_abort(talloc_parent(talloc_parent(a)), Tracee)
 
 extern Tracee *get_tracee(const Tracee * tracee, pid_t pid, bool create);
+extern Tracee *get_tracee_noreset(pid_t pid);
 extern Tracee *get_ptracee(const Tracee * ptracer, pid_t pid,
 			   bool only_stopped, bool only_with_pevent,
 			   word_t wait_options);

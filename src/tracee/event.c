@@ -37,6 +37,7 @@
 #include <inttypes.h>		/* PRI*, */
 #include <linux/version.h>	/* KERNEL_VERSION, */
 #include <sys/prctl.h>		/* prctl(2), PR_*, */
+#include <sys/socket.h>		/* socketpair(2), */
 
 #include "tracee/event.h"
 #include "cli/note.h"
@@ -44,6 +45,7 @@
 #include "path/binding.h"
 #include "syscall/syscall.h"
 #include "syscall/seccomp.h"
+#include "syscall/notify.h"
 #include "ptrace/wait.h"
 #include "extension/extension.h"
 #include "execve/elf.h"
@@ -59,6 +61,7 @@
 int launch_process(Tracee *tracee, char *const argv[])
 {
     char *const default_argv[] = { "-sh", NULL };
+    int notify_sockets[2] = { -1, -1 };
     long status;
     pid_t pid;
 
@@ -69,6 +72,15 @@ int launch_process(Tracee *tracee, char *const argv[])
     /* The program would inherit the no_new_privs flag of PRoot's
      * caller, whatever PRoot sets for itself.  */
     tracee->no_new_privs = (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1);
+
+    /* The program creates the seccomp notification listener along
+     * with its filter, then passes it to PRoot over this socket.  */
+    if (notify_wanted(tracee)
+	&& socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+		      notify_sockets) < 0) {
+	notify_sockets[0] = -1;
+	notify_sockets[1] = -1;
+    }
 
     pid = fork();
     switch (pid) {
@@ -94,8 +106,14 @@ int launch_process(Tracee *tracee, char *const argv[])
 
 	/* Improve performance by using seccomp mode 2, unless
 	 * this support is explicitly disabled.  */
-	if (getenv("PROOT_NO_SECCOMP") == NULL)
-	    (void) enable_syscall_filtering(tracee);
+	if (notify_sockets[0] >= 0) {
+	    int listener;
+
+	    (void) close(notify_sockets[0]);
+	    (void) enable_syscall_filtering(tracee, &listener);
+	    notify_send_listener(notify_sockets[1], listener);
+	} else if (getenv("PROOT_NO_SECCOMP") == NULL)
+	    (void) enable_syscall_filtering(tracee, NULL);
 
 	/* Now process is ptraced, so the current rootfs is already the
 	 * guest rootfs.  Note: Valgrind can't handle execve(2) on
@@ -107,6 +125,11 @@ int launch_process(Tracee *tracee, char *const argv[])
     default:			/* parent */
 	/* We know the pid of the first tracee now.  */
 	tracee->pid = pid;
+
+	if (notify_sockets[0] >= 0) {
+	    (void) close(notify_sockets[1]);
+	    notify_start(notify_sockets[0]);
+	}
 	return 0;
     }
 
@@ -347,6 +370,10 @@ int event_loop()
 	    note(NULL, WARNING, SYSTEM, "sigaction(%d)", signum);
     }
 
+    /* Tracees are shared with the seccomp notification workers,
+     * which can access them only while this loop waits.  */
+    notify_lock();
+
     while (1) {
 	int tracee_status;
 	Tracee *tracee;
@@ -357,10 +384,13 @@ int event_loop()
 	free_terminated_tracees();
 
 	/* Wait for the next tracee's stop. */
+	notify_unlock();
 	pid = waitpid(-1, &tracee_status, __WALL);
+	notify_lock();
 	if (pid < 0) {
 	    if (errno != ECHILD) {
 		note(NULL, ERROR, SYSTEM, "waitpid()");
+		notify_unlock();
 		return EXIT_FAILURE;
 	    }
 	    break;
@@ -390,6 +420,7 @@ int event_loop()
 	(void) restart_tracee(tracee, signal);
     }
 
+    notify_unlock();
     return last_exit_status;
 }
 

@@ -85,7 +85,10 @@ Action readlink_proc(const Tracee *tracee, char result[PATH_MAX],
     comparison = compare_paths(proc_path, base);
     switch (comparison) {
     case PATHS_ARE_EQUAL:
-	known_tracee = get_tracee(tracee, pid, false);
+	/* Don't reset its memory collector: this can be done by a
+	 * seccomp notification worker concurrently with others.  */
+	known_tracee = (pid == tracee->pid ? tracee
+			: get_tracee_noreset(pid));
 	if (known_tracee == NULL)
 	    return DEFAULT;
 

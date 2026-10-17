@@ -284,6 +284,65 @@ Effort and expected outcome
   should estimate it from the syscall mix before committing to the
   rest.
 
+Implementation status
+---------------------
+
+Implemented in ``src/syscall/notify.c``:
+
++ Listener creation by the first tracee (``seccomp(2)`` with
+  ``NEW_LISTENER``, plus ``WAIT_KILLABLE_RECV`` when available),
+  hand-off over a ``socketpair`` with ``SCM_RIGHTS``, and fallback to
+  the plain ``TRACE`` filter when anything fails.  The fast path is
+  enabled only on x86_64 and arm64, on Linux 5.5 or newer, when no
+  extension is loaded.  ``PROOT_NO_NOTIFY=1`` disables it and
+  ``PROOT_NOTIFY_THREADS`` sets the number of workers (default: the
+  number of CPUs).  ``-v 1`` reports whether it is enabled, ``-v 3``
+  logs each syscall a worker serves.
++ Served by the workers, for the native ABI only: the ``stat`` family
+  (``stat``, ``lstat``, ``newfstatat``, ``statx``), the ``access``
+  family (``access``, ``faccessat``, ``faccessat2``) and ``readlink``/
+  ``readlinkat`` (with detranslation of the target).  Calls with an
+  empty path (``AT_EMPTY_PATH``) and paths left as ``/proc/self`` are
+  passed back to the kernel unchanged (``CONTINUE``).
++ Locking: the event loop holds a writer-preferring read-write lock
+  while it handles an event, the workers hold it for reading while they
+  translate, so translations run concurrently.  ``proc.c`` no longer
+  resets another tracee's memory collector, which made translation
+  read-only.
++ Syscalls already translated at a ptrace stop (tracees under ptrace
+  emulation, or a stray syscall-enter stop) are recognized and passed
+  back to the kernel unchanged instead of being translated twice.
++ ``SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`` (Linux 6.6) is enabled when
+  available.  In the test VM it cut the cost of a bare notification
+  round trip from 40 to 4 microseconds.
+
+Measured in a 4-vCPU x86_64 VM (Linux 6.18), against the previous
+ptrace-only flow:
+
+=============================================  ==========  ==========
+Workload                                       Before      After
+=============================================  ==========  ==========
+``stat()`` loop, one thread                    55 us/call  13 us/call
+``find /usr -printf '%s %m'``, 1 instance      7.6 s       3.5 s
+``find /usr -printf '%s %m'``, 8 in parallel   31.6 s      16.1 s
+``make -j4`` of PRoot itself                   7.3 s       5.5 s
+=============================================  ==========  ==========
+
+Findings that change the plan:
+
++ A session has a single notification listener (the kernel refuses a
+  second one in the same filter chain), and in the test VM the listener
+  itself didn't scale beyond one client: the gains come mostly from
+  cheaper round trips and concurrent translations, less from running
+  syscalls in parallel.
++ In a C build, ``readlink`` (about half of all syscalls) and
+  ``openat`` dominate.  ``openat`` (Phase 3) and ``execve`` are the next
+  bottlenecks.
+
+Not done yet: Phase 3 (``open*`` and the mutating syscalls), Phase 4
+(``fake_id0`` and ``link2symlink``, so proot-distro sessions, which
+load both, don't benefit yet), and testing on Android.
+
 Open questions
 --------------
 
