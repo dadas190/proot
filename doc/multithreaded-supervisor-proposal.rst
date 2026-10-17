@@ -400,6 +400,41 @@ Findings that change the plan:
   the ``stat`` family alone: process creation and ``execve``, which
   remain on the single ptrace thread, are the next bottleneck.
 
+Process creation
+~~~~~~~~~~~~~~~~
+
+Creating a process remains handled by the ptrace thread.  Each
+``fork``/``execve``/``wait`` of a program used to cost about 15
+ptrace stops and 118 syscalls made by PRoot; it is now 9 stops and
+about 67 syscalls:
+
++ The seccomp filter checks the arguments of ``prctl`` (only the four
+  options PRoot handles), ``prlimit64`` (only a new ``RLIMIT_STACK``)
+  and ``setrlimit`` (only ``RLIMIT_STACK``): every program reads its
+  stack limit at startup, and the loader sets its name with
+  ``PR_SET_NAME``, for nothing.  These conditions are not used when an
+  extension is interested in these syscalls.
++ Exit and vfork-done events are requested only for the ptracees
+  whose emulated ptracer asks for them.
++ ``wait4``/``waitpid`` are served by the workers: the kernel performs
+  them as-is unless the tracee is an emulated ptracer, in which case it
+  is switched to the ptrace flow for good (stopped with ``SIGSTOP``,
+  then the syscall is restarted with ``ERESTARTNOINTR``).
++ The ELF program headers are read at once, the executability of a
+  program is checked with one ``access(2)`` instead of three
+  syscalls, and the ``lstat(2)`` made during a canonicalization are
+  memoized, since the same components are checked again each time a
+  symlink is dereferenced.
++ A process that has exited is not restarted anymore.
+
+In the test VM the overhead of a shell loop running ``true`` went
+from 0.42 s to 0.36 s per 500 iterations (0.6 s natively).  What
+remains is inherent to ptrace or to the loader: fork, exec and exit
+events, the stops of ``execve`` (enter, exec event, exit), the
+emulation of ``brk`` (2 stops per call, required since the kernel puts
+the heap after the loader instead of the program) and signal
+deliveries such as ``SIGCHLD``.
+
 Fixed along the way: ``link2symlink`` wrote a ``struct stat`` into the
 ``struct statx`` of ``statx(2)`` callers (wrong size and inode for fake
 hard links), and read an uninitialized mode when ``lstat(2)`` failed.

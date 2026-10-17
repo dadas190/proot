@@ -140,7 +140,6 @@ int
 translate_and_check_exec(Tracee *tracee, char host_path[PATH_MAX],
 			 const char *user_path)
 {
-    struct stat statl;
     int status;
 
     if (user_path[0] == '\0')
@@ -150,17 +149,11 @@ translate_and_check_exec(Tracee *tracee, char host_path[PATH_MAX],
     if (status < 0)
 	return status;
 
-    status = access(host_path, F_OK);
-    if (status < 0)
-	return -ENOENT;
-
+    /* This is done for each execve(2): check the existence only
+     * to report the right error.  */
     status = access(host_path, X_OK);
     if (status < 0)
-	return -EACCES;
-
-    status = lstat(host_path, &statl);
-    if (status < 0)
-	return -EPERM;
+	return (access(host_path, F_OK) < 0 ? -ENOENT : -EACCES);
 
     return 0;
 }

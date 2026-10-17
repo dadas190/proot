@@ -241,6 +241,10 @@ static void print_talloc_hierarchy(int signum, siginfo_t *siginfo UNUSED,
 
 static int last_exit_status = -1;
 
+/* Options PRoot has set to trace the first tracee, inherited by all
+ * the others.  */
+unsigned long proot_ptrace_options = DEFAULT_PTRACE_OPTIONS;
+
 /**
  * Check if kernel >= 4.8
  */
@@ -485,13 +489,7 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee,
 
 	case SIGTRAP:{
 		const unsigned long default_ptrace_options
-		    =
-		    (PTRACE_O_TRACESYSGOOD |
-		     PTRACE_O_TRACEFORK |
-		     PTRACE_O_TRACEVFORK |
-		     PTRACE_O_TRACEVFORKDONE |
-		     PTRACE_O_TRACEEXEC |
-		     PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT);
+		    = DEFAULT_PTRACE_OPTIONS;
 
 		/* Distinguish some events from others and
 		 * automatically trace each new process with
@@ -511,8 +509,11 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee,
 		    ptrace(PTRACE_SETOPTIONS, tracee->pid,
 			   NULL,
 			   default_ptrace_options | PTRACE_O_TRACESECCOMP);
+		proot_ptrace_options =
+		    default_ptrace_options | PTRACE_O_TRACESECCOMP;
 		if (status < 0) {
 		    seccomp_enabled = false;
+		    proot_ptrace_options = default_ptrace_options;
 		    /* ... otherwise use default options only.  */
 		    status =
 			ptrace(PTRACE_SETOPTIONS,
@@ -716,13 +717,7 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 	case SIGTRAP:{
 		const unsigned long default_ptrace_options
-		    =
-		    (PTRACE_O_TRACESYSGOOD |
-		     PTRACE_O_TRACEFORK |
-		     PTRACE_O_TRACEVFORK |
-		     PTRACE_O_TRACEVFORKDONE |
-		     PTRACE_O_TRACEEXEC |
-		     PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT);
+		    = DEFAULT_PTRACE_OPTIONS;
 
 		/* Distinguish some events from others and
 		 * automatically trace each new process with
@@ -742,7 +737,10 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		    ptrace(PTRACE_SETOPTIONS, tracee->pid,
 			   NULL,
 			   default_ptrace_options | PTRACE_O_TRACESECCOMP);
+		proot_ptrace_options =
+		    default_ptrace_options | PTRACE_O_TRACESECCOMP;
 		if (status < 0) {
+		    proot_ptrace_options = default_ptrace_options;
 		    /* ... otherwise use default options only.  */
 		    status =
 			ptrace(PTRACE_SETOPTIONS,
@@ -903,6 +901,10 @@ bool restart_tracee(Tracee *tracee, int signal)
 
     /* Put in the "stopped"/"waiting for ptracee" state?.  */
     if (tracee->as_ptracer.wait_pid != 0 || signal == -1)
+	return false;
+
+    /* There's nothing to restart once it has exited.  */
+    if (tracee->terminated)
 	return false;
 
     /* Restart the tracee and stop it at the next instruction, or

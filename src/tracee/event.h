@@ -24,8 +24,27 @@
 #define TRACEE_EVENT_H
 
 #include <stdbool.h>
+#include <sys/ptrace.h>	/* PTRACE_O_*, */
 
 #include "tracee/tracee.h"
+#include "compat.h"
+
+/* Events PRoot is interested in.  Exit and vfork-done events are
+ * requested only for the ptracees whose ptracer asks for them, see
+ * PTRACE_SETOPTIONS in ptrace/ptrace.c, since each of them costs a
+ * stop.  */
+#define DEFAULT_PTRACE_OPTIONS (PTRACE_O_TRACESYSGOOD		\
+				| PTRACE_O_TRACEFORK		\
+				| PTRACE_O_TRACEVFORK		\
+				| PTRACE_O_TRACEEXEC		\
+				| PTRACE_O_TRACECLONE)
+
+/* Events requested only for the ptracees whose ptracer asks for
+ * them.  */
+#define ON_DEMAND_PTRACE_OPTIONS (PTRACE_O_TRACEEXIT		\
+				  | PTRACE_O_TRACEVFORKDONE)
+
+extern unsigned long proot_ptrace_options;
 
 extern int launch_process(Tracee * tracee, char *const argv[]);
 extern int event_loop();

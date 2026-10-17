@@ -124,6 +124,71 @@ static inline Finality next_component(char component[NAME_MAX],
     return NOT_FINAL;
 }
 
+/* Results of lstat(2) made during the canonicalization of a path:
+ * the same components are checked several times when a symlink is
+ * dereferenced, since the canonicalization restarts from the root.
+ * This is done for each syscall with a path, and several times for
+ * each execve(2).  */
+#define LSTAT_MEMO_ENTRIES 16
+#define LSTAT_MEMO_POOL 4096
+
+typedef struct {
+    size_t nb_entries;
+    size_t pool_used;
+    struct {
+	size_t path_offset;
+	mode_t mode;
+	int error;
+    } entries[LSTAT_MEMO_ENTRIES];
+    char pool[LSTAT_MEMO_POOL];
+} LstatMemo;
+
+/* Memo of the canonicalization in progress in this thread, if any.  */
+static __thread LstatMemo *lstat_memo = NULL;
+
+/**
+ * Same as lstat(2) on @path, but only the type of the file is
+ * reported in @mode, possibly from lstat_memo.  This function returns
+ * -1 and sets errno if an error occured, otherwise 0.
+ */
+static int memo_lstat(const char *path, mode_t *mode)
+{
+    LstatMemo *memo = lstat_memo;
+    struct stat statl;
+    size_t length;
+    size_t i;
+    int status;
+
+    if (memo != NULL) {
+	for (i = 0; i < memo->nb_entries; i++) {
+	    if (strcmp(memo->pool + memo->entries[i].path_offset, path)
+		== 0) {
+		*mode = memo->entries[i].mode;
+		errno = memo->entries[i].error;
+		return (errno != 0 ? -1 : 0);
+	    }
+	}
+    }
+
+    statl.st_mode = 0;
+    status = lstat(path, &statl);
+    *mode = statl.st_mode;
+
+    length = strlen(path) + 1;
+    if (memo != NULL && memo->nb_entries < LSTAT_MEMO_ENTRIES
+	&& memo->pool_used + length <= LSTAT_MEMO_POOL) {
+	i = memo->nb_entries++;
+	memo->entries[i].path_offset = memo->pool_used;
+	memo->entries[i].mode = statl.st_mode;
+	memo->entries[i].error = (status < 0 ? errno : 0);
+	memcpy(memo->pool + memo->pool_used, path, length);
+	memo->pool_used += length;
+	errno = memo->entries[i].error;
+    }
+
+    return status;
+}
+
 /**
  * Resolve bindings (if any) in @guest_path and copy the translated
  * path into @host_path.  Also, this function checks that a non-final
@@ -155,7 +220,7 @@ static inline int substitute_binding_stat(Tracee *tracee,
     }
 
     statl.st_mode = 0;
-    status = lstat(host_path, &statl);
+    status = memo_lstat(host_path, &statl.st_mode);
 
     /* Build the glue between the hostfs and the guestfs during
      * the initialization of a binding.  */
@@ -187,8 +252,37 @@ static inline int substitute_binding_stat(Tracee *tracee,
  * what you are doing. This function returns -errno if an error
  * occured, otherwise it returns 0.
  */
+static int canonicalize2(Tracee *tracee, const char *user_path,
+			 bool deref_final, char guest_path[PATH_MAX],
+			 unsigned int recursion_level);
+
 int canonicalize(Tracee *tracee, const char *user_path, bool deref_final,
 		 char guest_path[PATH_MAX], unsigned int recursion_level)
+{
+    LstatMemo memo;
+    int status;
+
+    /* Memoize lstat(2) during the outermost canonicalization only,
+     * and not while a binding is initialized since the glue makes
+     * missing components appear.  */
+    if (lstat_memo != NULL || tracee == NULL || tracee->glue_type != 0)
+	return canonicalize2(tracee, user_path, deref_final, guest_path,
+			     recursion_level);
+
+    memo.nb_entries = 0;
+    memo.pool_used = 0;
+    lstat_memo = &memo;
+
+    status = canonicalize2(tracee, user_path, deref_final, guest_path,
+			   recursion_level);
+
+    lstat_memo = NULL;
+    return status;
+}
+
+static int canonicalize2(Tracee *tracee, const char *user_path,
+			 bool deref_final, char guest_path[PATH_MAX],
+			 unsigned int recursion_level)
 {
     char scratch_path[PATH_MAX];
     char host_path[PATH_MAX];

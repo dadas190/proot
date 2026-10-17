@@ -86,6 +86,7 @@ void notify_unlock(void)
 #include "tracee/reg.h"
 #include "path/path.h"
 #include "syscall/syscall.h"
+#include "ptrace/wait.h"
 #include "extension/extension.h"
 #include "cli/note.h"
 #include "arch.h"
@@ -168,6 +169,14 @@ static const Sysnum routed_open_sysnums[] = {
     PR_open,
     PR_openat,
 #endif
+    PR_void
+};
+
+/* Syscalls the ptrace flow handles only for ptracers (ptrace
+ * emulation), see handle_wait().  */
+static const Sysnum routed_wait_sysnums[] = {
+    PR_wait4,
+    PR_waitpid,
     PR_void
 };
 
@@ -307,6 +316,7 @@ bool notify_wanted(const Tracee *tracee)
 
     count += route(tracee, routed_sysnums);
     count += route(tracee, routed_emulated_sysnums);
+    count += route(tracee, routed_wait_sysnums);
     count += route(tracee, extra_sysnums);
 
     /* SECCOMP_ADDFD_FLAG_SEND appeared in Linux 5.14.  */
@@ -1255,6 +1265,67 @@ static bool notify_take_note(const NotifiedCall *call)
     return true;
 }
 
+#if !defined(ERESTARTNOINTR)
+#define ERESTARTNOINTR 513
+#endif
+
+/**
+ * Handle wait4(2) and waitpid(2): the kernel performs them as-is,
+ * unless the tracee waits for ptracees whose ptracer is emulated by
+ * PRoot (see translate_wait_enter()).  This tracee is then switched
+ * to the ptrace flow for good, like ptracees are: it is stopped and
+ * the syscall is restarted, to be handled at the next ptrace stop.
+ */
+static Action handle_wait(const NotifiedCall *call)
+{
+    const struct seccomp_notif *request = call->request;
+    Action action = CONTINUE;
+    Tracee *tracee;
+    size_t i;
+
+    tracee = lock_tracee(call->pid, true);
+    if (tracee == NULL)
+	return CONTINUE;
+
+    /* Translated at a ptrace stop already, see translate().  */
+    if (tracee->seccomp != ENABLED)
+	goto end;
+
+    if (tracee->notify.valid
+	&& tracee->notify.sysnum == (word_t) request->data.nr) {
+	for (i = 0; i < 6; i++) {
+	    if (tracee->notify.args[i] != request->data.args[i])
+		break;
+	}
+	if (i == 6) {
+	    tracee->notify.valid = false;
+	    goto end;
+	}
+    }
+
+    if (tracee->as_ptracer.nb_ptracees == 0) {
+	tracee->as_ptracer.waits_in = WAITS_IN_KERNEL;
+	goto end;
+    }
+
+    /* The kernel restarts the syscall once the tracee has been
+     * stopped, as it does when a signal interrupts it.  */
+    tracee->seccomp = DISABLED;
+    if (kill(tracee->pid, SIGSTOP) < 0) {
+	note(tracee, WARNING, SYSTEM, "can't stop ptracer %d",
+	     tracee->pid);
+	goto end;
+    }
+    tracee->sigstop = SIGSTOP_IGNORED;
+    action = DROP;
+
+  end:
+    VERBOSE(tracee, 3, "vpid %" PRIu64 ": wait %s by a worker",
+	    tracee->vpid, action == CONTINUE ? "continued" : "restarted");
+    unlock();
+    return action;
+}
+
 /**
  * Perform @call on behalf of the tracee, once its paths are
  * translated: put its result in @call->result and its output in
@@ -1533,6 +1604,14 @@ static Action handle_call(int listener, NotifiedCall *call)
 
     if (notify_take_note(call))
 	return CONTINUE;
+
+    if (call->sysnum == PR_wait4 || call->sysnum == PR_waitpid) {
+	if (handle_wait(call) == CONTINUE)
+	    return CONTINUE;
+
+	call->result = -ERESTARTNOINTR;
+	return REPLY;
+    }
 
     /* Not reachable unless the filter and the decoder disagree.  */
     if (!decode(call))

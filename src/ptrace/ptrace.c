@@ -280,6 +280,17 @@ int translate_ptrace_exit(Tracee *tracee)
 	    return -EINVAL;
 	}
 	PTRACEE.options = data;
+
+	/* PRoot doesn't request these events for itself, see
+	 * DEFAULT_PTRACE_OPTIONS.  The ptracee is stopped.  */
+	if ((data & ON_DEMAND_PTRACE_OPTIONS) != 0) {
+	    status = ptrace(PTRACE_SETOPTIONS, pid, NULL,
+			    proot_ptrace_options
+			    | (data & ON_DEMAND_PTRACE_OPTIONS));
+	    if (status < 0)
+		return -errno;
+	}
+
 	return 0;		/* Don't restart the ptracee.  */
 
     case PTRACE_GETEVENTMSG:{

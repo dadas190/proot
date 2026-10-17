@@ -100,6 +100,7 @@ int iterate_program_headers(const Tracee *tracee, int fd,
 			    void *data)
 {
     ProgramHeader program_header;
+    ProgramHeader program_headers[32];
 
     uint64_t elf_phoff;
     uint16_t elf_phentsize;
@@ -128,6 +129,28 @@ int iterate_program_headers(const Tracee *tracee, int fd,
 	note(tracee, WARNING, INTERNAL,
 	     "%d: unsupported size of program header.", fd);
 	return -ENOTSUP;
+    }
+
+    /* Read the whole table at once when it is not too big, this
+     * is done for each execve(2).  */
+    if ((size_t) elf_phnum * elf_phentsize <= sizeof(program_headers)) {
+	ssize_t size = (ssize_t) elf_phnum * elf_phentsize;
+
+	status = pread(fd, program_headers, size, elf_phoff);
+	if (status != size)
+	    return (status < 0 ? -errno : -ENOTSUP);
+
+	for (i = 0; i < elf_phnum; i++) {
+	    memcpy(&program_header,
+		   (uint8_t *) program_headers + (size_t) i * elf_phentsize,
+		   elf_phentsize);
+
+	    status = callback(elf_header, &program_header, data);
+	    if (status != 0)
+		return status;
+	}
+
+	return 0;
     }
 
     status = (int) lseek(fd, elf_phoff, SEEK_SET);

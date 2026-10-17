@@ -40,6 +40,7 @@
 #include <stddef.h>		/* offsetof(3), */
 #include <stdint.h>		/* uint*_t, UINT*_MAX, */
 #include <assert.h>		/* assert(3), */
+#include <sys/resource.h>	/* RLIMIT_STACK, */
 #include <endian.h>		/* __BYTE_ORDER, */
 
 #include "syscall/seccomp.h"
@@ -185,19 +186,165 @@ static int add_conditional_syscall(struct sock_fprog *program,
 }
 #endif
 
+/* Conditions under which PRoot has something to do with a syscall,
+ * checked by the seccomp filter itself to save a ptrace stop for the
+ * other calls: the lower 32 bits of the argument number @arg are one
+ * of @values, and the argument number @non_null_arg (if >= 0) is not
+ * null.  */
+typedef struct {
+    Sysnum sysnum;
+    size_t arg;
+    size_t nb_values;
+    uint32_t values[4];
+    int non_null_arg;
+} TraceCondition;
+
+static const TraceCondition trace_conditions[] = {
+    /* See translate_syscall_enter() and translate_syscall_exit():
+     * the loader's PR_SET_NAME, for instance, is left alone.  */
+    { PR_prctl, 0, 4, { PR_SET_DUMPABLE, PR_GET_NO_NEW_PRIVS,
+			PR_SET_NO_NEW_PRIVS, PR_GET_AUXV }, -1 },
+
+    /* See translate_setrlimit_exit(): only a new RLIMIT_STACK
+     * matters, whereas every program reads it at startup.  */
+    { PR_prlimit64, 1, 1, { RLIMIT_STACK }, 2 },
+    { PR_setrlimit, 0, 1, { RLIMIT_STACK }, -1 },
+
+    { PR_void, 0, 0, { 0 }, -1 },
+};
+
+/**
+ * Return the trace condition of @sysnum, or NULL if it is
+ * unconditionally traced.
+ */
+static const TraceCondition *get_trace_condition(Sysnum sysnum)
+{
+    size_t i;
+
+    for (i = 0; trace_conditions[i].sysnum != PR_void; i++) {
+	if (trace_conditions[i].sysnum == sysnum)
+	    return &trace_conditions[i];
+    }
+
+    return NULL;
+}
+
+/**
+ * Return the offset of the lower 32 bits (or the upper ones if @upper)
+ * of the argument number @arg in struct seccomp_data.
+ */
+static size_t arg_offset(size_t arg, bool upper)
+{
+    size_t offset = offsetof(struct seccomp_data, args) + arg * sizeof(__u64);
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+    if (!upper)
+	offset += sizeof(__u32);
+#else
+    if (upper)
+	offset += sizeof(__u32);
+#endif
+
+    return offset;
+}
+
+/**
+ * Return the number of statements add_traced_if() appends for
+ * @condition.
+ */
+static size_t length_traced_if(const TraceCondition *condition)
+{
+    return condition->nb_values + (condition->non_null_arg >= 0 ? 9 : 5);
+}
+
+/**
+ * Append to @program->filter the statements required to notify PRoot
+ * about the given @syscall with the given @action, but only under
+ * @condition, otherwise to allow it.  This function returns -errno
+ * if an error occurred, otherwise 0.
+ */
+static int add_traced_if(struct sock_fprog *program, word_t syscall,
+			 const TraceCondition *condition, uint32_t action)
+{
+    const size_t nb_values = condition->nb_values;
+    const size_t length = length_traced_if(condition);
+    struct sock_filter statements[16];
+    size_t i = 0;
+    size_t k;
+
+    /* Sanity checks.  */
+    if (syscall > UINT32_MAX || length > sizeof(statements) / sizeof(statements[0]))
+	return -ERANGE;
+
+    /* Skip this block if this is not the expected syscall.  */
+    statements[i++] = (struct sock_filter)
+	BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, length - 1);
+
+    /* Go to the "match" statement if the argument is one of the
+     * values, otherwise allow the syscall.  */
+    statements[i++] = (struct sock_filter)
+	BPF_STMT(BPF_LD + BPF_W + BPF_ABS, arg_offset(condition->arg, false));
+    for (k = 0; k < nb_values; k++)
+	statements[i++] = (struct sock_filter)
+	    BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, condition->values[k],
+		     nb_values - k, 0);
+    statements[i++] = (struct sock_filter)
+	BPF_STMT(BPF_JMP + BPF_JA + BPF_K, length - nb_values - 4);
+
+    /* Match: allow the syscall if the pointer is null, otherwise
+     * notify the tracer.  */
+    if (condition->non_null_arg >= 0) {
+	statements[i++] = (struct sock_filter)
+	    BPF_STMT(BPF_LD + BPF_W + BPF_ABS,
+		     arg_offset(condition->non_null_arg, false));
+	statements[i++] = (struct sock_filter)
+	    BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0, 0, 2);
+	statements[i++] = (struct sock_filter)
+	    BPF_STMT(BPF_LD + BPF_W + BPF_ABS,
+		     arg_offset(condition->non_null_arg, true));
+	statements[i++] = (struct sock_filter)
+	    BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0, 1, 0);
+    }
+
+    statements[i++] = (struct sock_filter) BPF_STMT(BPF_RET + BPF_K, action);
+    statements[i++] = (struct sock_filter)
+	BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW);
+
+    /* Sanity check.  */
+    if (i != length)
+	return -ERANGE;
+
+    DEBUG_FILTER("FILTER:     trace if syscall == %ld under condition\n",
+		 syscall);
+
+    return add_statements(program, length, statements);
+}
+
 /**
  * Append to @program->filter the statements for the given @syscall,
  * that is @sysnum: they notify the workers if @notified (see
- * notify.c), otherwise the tracer with the given @flags.  Only the
- * number of statements is computed if @program is NULL.  This
- * function returns -errno if an error occurred, otherwise this
- * number.
+ * notify.c), otherwise the tracer with the given @flags, possibly
+ * under a trace condition if @conditional.  Only the number of
+ * statements is computed if @program is NULL.  This function returns
+ * -errno if an error occurred, otherwise this number.
  */
 static int add_syscall(struct sock_fprog *program, word_t syscall,
-		       Sysnum sysnum, word_t flags, bool notified)
+		       Sysnum sysnum, word_t flags, bool notified,
+		       bool conditional)
 {
     uint32_t action = SECCOMP_RET_TRACE + flags;
+    const TraceCondition *condition;
     int status;
+
+    condition = (conditional && !notified
+		 ? get_trace_condition(sysnum) : NULL);
+    if (condition != NULL) {
+	if (program == NULL)
+	    return length_traced_if(condition);
+
+	status = add_traced_if(program, syscall, condition, action);
+	return (status < 0 ? status : (int) length_traced_if(condition));
+    }
 
 #if defined(NOTIFY_SUPPORTED)
     size_t arg;
@@ -375,6 +522,31 @@ static int install_with_listener(struct sock_fprog *program, int *listener)
 #endif
 
 /**
+ * Check whether an extension of @tracee is interested in @sysnum, in
+ * which case PRoot can't assume when it has nothing to do with it.
+ */
+static bool filtered_by_extensions(const Tracee *tracee, Sysnum sysnum)
+{
+    Extension *extension;
+    size_t i;
+
+    if (tracee->extensions == NULL)
+	return false;
+
+    LIST_FOREACH(extension, tracee->extensions, link) {
+	if (extension->filtered_sysnums == NULL)
+	    continue;
+
+	for (i = 0; extension->filtered_sysnums[i].value != PR_void; i++) {
+	    if (extension->filtered_sysnums[i].value == sysnum)
+		return true;
+	}
+    }
+
+    return false;
+}
+
+/**
  * Convert the given @sysnums into BPF filters according to the
  * following pseudo-code, then enabled them for the given @tracee and
  * all of its future children:
@@ -389,7 +561,8 @@ static int install_with_listener(struct sock_fprog *program, int *listener)
  * in @listener, only if @listener is not NULL.  This function returns
  * -errno if an error occurred, otherwise 0.
  */
-static int set_seccomp_filters(const FilteredSysnum *sysnums, int *listener)
+static int set_seccomp_filters(const Tracee *tracee,
+			       const FilteredSysnum *sysnums, int *listener)
 {
     SeccompArch seccomp_archs[] = SECCOMP_ARCHS;
     size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
@@ -441,7 +614,9 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums, int *listener)
 		    status =
 			add_syscall(pass == 0 ? NULL : &program, syscall,
 				    sysnums[k].value, sysnums[k].flags,
-				    notified);
+				    notified,
+				    !filtered_by_extensions(tracee,
+							    sysnums[k].value));
 		    if (status < 0)
 			goto end;
 
@@ -682,14 +857,14 @@ int enable_syscall_filtering(const Tracee *tracee, int *listener)
 	/* Fall back to the ptrace flow for all syscalls, eg. when
 	 * another filter has a listener already (EBUSY).  */
 	if (status >= 0)
-	    status = set_seccomp_filters(notified_sysnums, listener);
+	    status = set_seccomp_filters(tracee, notified_sysnums, listener);
 	if (status >= 0)
 	    return 0;
 
 	*listener = -1;
     }
 
-    status = set_seccomp_filters(filtered_sysnums, NULL);
+    status = set_seccomp_filters(tracee, filtered_sysnums, NULL);
     if (status < 0)
 	return status;
 
