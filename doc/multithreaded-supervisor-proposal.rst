@@ -298,17 +298,40 @@ Implemented in ``src/syscall/notify.c``:
   ``PROOT_NOTIFY_THREADS`` sets the number of workers (default: the
   number of CPUs).  ``-v 1`` reports whether it is enabled, ``-v 3``
   logs each syscall a worker serves.
-+ Served by the workers, for the native ABI only: the ``stat`` family
-  (``stat``, ``lstat``, ``newfstatat``, ``statx``), the ``access``
-  family (``access``, ``faccessat``, ``faccessat2``) and ``readlink``/
-  ``readlinkat`` (with detranslation of the target).  Calls with an
-  empty path (``AT_EMPTY_PATH``) and paths left as ``/proc/self`` are
-  passed back to the kernel unchanged (``CONTINUE``).
++ Served by the workers, for the native ABI only:
+
+  - queries: the ``stat`` family (``stat``, ``lstat``, ``newfstatat``,
+    ``statx``), the ``access`` family (``access``, ``faccessat``,
+    ``faccessat2``) and ``readlink``/``readlinkat`` (with
+    detranslation of the target);
+  - opening: ``open``, ``openat`` and ``creat``, on Linux 5.14 or
+    newer.  The new descriptor is installed in the tracee with
+    ``SECCOMP_IOCTL_NOTIF_ADDFD`` and ``SECCOMP_ADDFD_FLAG_SEND``.
+    ``O_PATH`` opens stay on the ptrace flow, the filter checks the
+    flags, since the kernel can't install such a descriptor.  Opening
+    a FIFO or a device, which may block, is done by a thread of its
+    own;
+  - modifications: ``mkdir``, ``mkdirat``, ``mknod``, ``mknodat``,
+    ``unlink``, ``unlinkat``, ``rmdir``, ``rename``, ``renameat``,
+    ``renameat2`` (with the update of the virtual working directory),
+    ``link``, ``linkat``, ``symlink``, ``symlinkat``, ``chmod``,
+    ``fchmodat``, ``fchmodat2``, ``chown``, ``lchown``, ``fchownat``,
+    ``utimensat`` and ``truncate``.
+
++ Workers create files with a umask of 0 and apply the tracee's one,
+  which ``umask(2)`` calls keep up to date (they are reported to the
+  workers for that purpose only, then performed by the kernel).
++ Calls with an empty path (``AT_EMPTY_PATH``), and calls whose paths
+  need no translation at all (eg. ``/dev/null`` when ``/dev`` is bound
+  to itself), are passed back to the kernel unchanged (``CONTINUE``),
+  which also covers what only the tracee can resolve (``/proc/self``).
 + Locking: the event loop holds a writer-preferring read-write lock
   while it handles an event, the workers hold it for reading while they
   translate, so translations run concurrently.  ``proc.c`` no longer
   resets another tracee's memory collector, which made translation
-  read-only.
+  read-only.  Workers take it for writing only to redirect
+  ``/proc/self/auxv``, to update the working directory after a rename
+  and to record a umask.
 + Syscalls already translated at a ptrace stop (tracees under ptrace
   emulation, or a stray syscall-enter stop) are recognized and passed
   back to the kernel unchanged instead of being translated twice.
@@ -317,16 +340,18 @@ Implemented in ``src/syscall/notify.c``:
   round trip from 40 to 4 microseconds.
 
 Measured in a 4-vCPU x86_64 VM (Linux 6.18), against the previous
-ptrace-only flow:
+ptrace-only flow, with paths that need a translation:
 
-=============================================  ==========  ==========
-Workload                                       Before      After
-=============================================  ==========  ==========
-``stat()`` loop, one thread                    55 us/call  13 us/call
-``find /usr -printf '%s %m'``, 1 instance      7.6 s       3.5 s
-``find /usr -printf '%s %m'``, 8 in parallel   31.6 s      16.1 s
-``make -j4`` of PRoot itself                   7.3 s       5.5 s
-=============================================  ==========  ==========
+==================================================  ==========  ==========
+Workload                                            Before      After
+==================================================  ==========  ==========
+``stat()`` loop, one thread                         55 us/call  13 us/call
+``open()`` + ``close()`` loop                       31 us/call  21 us/call
+``open(O_CREAT)`` + ``close()`` loop                35 us/call  25 us/call
+``find -printf '%s %m'`` over ``/usr``, 1 instance  7.7 s       2.4 s
+same, 8 instances in parallel                       20.2 s      10.9 s
+``make -j4`` of PRoot itself                        5.1 s       4.0 s
+==================================================  ==========  ==========
 
 Findings that change the plan:
 
@@ -335,13 +360,16 @@ Findings that change the plan:
   itself didn't scale beyond one client: the gains come mostly from
   cheaper round trips and concurrent translations, less from running
   syscalls in parallel.
-+ In a C build, ``readlink`` (about half of all syscalls) and
-  ``openat`` dominate.  ``openat`` (Phase 3) and ``execve`` are the next
-  bottlenecks.
++ During ``make -j4``, the workers now serve about 140,000 syscalls
+  and ptrace stops are down to about 7,000 (``brk``, ``prlimit64``,
+  ``execve``, ``wait4``...), but the build is barely faster than with
+  the ``stat`` family alone: process creation and ``execve``, which
+  remain on the single ptrace thread, are the next bottleneck.
 
-Not done yet: Phase 3 (``open*`` and the mutating syscalls), Phase 4
-(``fake_id0`` and ``link2symlink``, so proot-distro sessions, which
-load both, don't benefit yet), and testing on Android.
+Not done yet: Phase 4 (``fake_id0`` and ``link2symlink``, so
+proot-distro sessions, which load both, don't benefit yet), the less
+common syscalls (``*xattr``, ``utime``/``utimes``/``futimesat``,
+``statfs``, ``bind``/``connect``...) and testing on Android.
 
 Open questions
 --------------

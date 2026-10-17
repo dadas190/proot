@@ -67,6 +67,11 @@ typedef struct {
 
     /* Current working directory, à la /proc/self/pwd.  */
     char *cwd;
+
+    /* File mode creation mask, as last set by umask(2), or -1 if
+     * unknown.  Only maintained under seccomp user notification,
+     * see notify.c.  */
+    int umask;
 } FileSystemNameSpace;
 
 /* Virtual heap, emulated with a regular memory mapping.  */

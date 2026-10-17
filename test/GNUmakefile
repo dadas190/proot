@@ -170,6 +170,9 @@ $(ROOTFS)/bin/%: %.c
 $(ROOTFS)/bin/test-stat-access-concurrent: test-stat-access-concurrent.c
 	$(Q)$(CC) -static $< -pthread -o $@ $(silently) || true
 
+$(ROOTFS)/bin/test-file-ops-concurrent: test-file-ops-concurrent.c
+	$(Q)$(CC) -static $< -pthread -o $@ $(silently) || true
+
 # Special cases.
 test-rlimit-stack-brk: test-rlimit-stack-brk.c
 	$(Q)$(CC) $< -o $@ $(silently) || true

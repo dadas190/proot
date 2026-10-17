@@ -45,6 +45,7 @@
 #include "path/binding.h"
 #include "syscall/syscall.h"
 #include "syscall/seccomp.h"
+#include "build.h"
 #include "syscall/notify.h"
 #include "ptrace/wait.h"
 #include "extension/extension.h"
@@ -72,6 +73,10 @@ int launch_process(Tracee *tracee, char *const argv[])
     /* The program would inherit the no_new_privs flag of PRoot's
      * caller, whatever PRoot sets for itself.  */
     tracee->no_new_privs = (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1);
+
+    /* The program inherits PRoot's file mode creation mask.  */
+    tracee->fs->umask = umask(0);
+    (void) umask(tracee->fs->umask);
 
     /* The program creates the seccomp notification listener along
      * with its filter, then passes it to PRoot over this socket.  */

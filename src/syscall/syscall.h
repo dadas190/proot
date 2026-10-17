@@ -24,6 +24,7 @@
 #define SYSCALL_H
 
 #include <limits.h>		/* PATH_MAX, */
+#include <stdbool.h>		/* bool, */
 
 #include "tracee/tracee.h"
 #include "tracee/reg.h"
@@ -36,5 +37,13 @@ extern int set_sysarg_path(Tracee * tracee, const char path[PATH_MAX],
 extern void translate_syscall(Tracee * tracee);
 extern int translate_syscall_enter(Tracee * tracee);
 extern void translate_syscall_exit(Tracee * tracee);
+
+extern bool is_own_auxv_requested(const Tracee * tracee,
+				  const char *user_path, int flags);
+extern const char *get_own_auxv_path(Tracee * tracee,
+				     const char *host_path);
+extern int update_cwd_after_rename(Tracee * tracee,
+				   char old_path[PATH_MAX],
+				   char new_path[PATH_MAX]);
 
 #endif				/* SYSCALL_H */

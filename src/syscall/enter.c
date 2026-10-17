@@ -91,45 +91,54 @@ static int translate_sysarg(Tracee *tracee, Reg reg, Type type)
 }
 
 /**
- * Make the @reg argument of the current syscall point to a copy of
- * @tracee's auxiliary vector with AT_EXECFN fixed up, if @user_path
- * names the tracee's own auxv file -- as "/proc/self/auxv" or
- * "/proc/<pid>/auxv", the spellings QEMU's user-mode emulation answers
- * too -- and @flags open it for reading only.  The kernel shows there
- * the vector it saved for the loader, whose AT_EXECFN names the loader
- * instead of the program.
+ * Check whether @user_path names @tracee's own auxv file -- as
+ * "/proc/self/auxv" or "/proc/<pid>/auxv", the spellings QEMU's
+ * user-mode emulation answers too -- and @flags open it for reading
+ * only, see get_own_auxv_path().
  */
-static void redirect_own_auxv(Tracee *tracee,
-			      const char user_path[PATH_MAX], int flags,
-			      Reg reg)
+bool is_own_auxv_requested(const Tracee *tracee, const char *user_path,
+			   int flags)
 {
-    char host_path[PATH_MAX];
     char proc_path[64];
+
+    if (tracee->execfn_addr == 0 || (flags & O_ACCMODE) != O_RDONLY
+	|| strncmp(user_path, "/proc/", strlen("/proc/")) != 0)
+	return false;
+
+    (void) snprintf(proc_path, sizeof(proc_path), "/proc/%d/auxv",
+		    tracee->pid);
+    return (strcmp(user_path, "/proc/self/auxv") == 0
+	    || strcmp(user_path, proc_path) == 0);
+}
+
+/**
+ * Return the path to a copy of @tracee's auxiliary vector with
+ * AT_EXECFN fixed up, to be opened instead of @host_path, the
+ * translation of a path is_own_auxv_requested() accepted.  The kernel
+ * shows there the vector it saved for the loader, whose AT_EXECFN
+ * names the loader instead of the program.  This function returns
+ * NULL if @host_path has to be opened as-is.
+ */
+const char *get_own_auxv_path(Tracee *tracee, const char *host_path)
+{
     uint8_t vectors[4096];
+    char proc_path[64];
     ssize_t size;
     ssize_t status;
     int fd;
 
-    if (tracee->execfn_addr == 0 || (flags & O_ACCMODE) != O_RDONLY
-	|| strncmp(user_path, "/proc/", strlen("/proc/")) != 0)
-	return;
-
     (void) snprintf(proc_path, sizeof(proc_path), "/proc/%d/auxv",
 		    tracee->pid);
-    if (strcmp(user_path, "/proc/self/auxv") != 0
-	&& strcmp(user_path, proc_path) != 0)
-	return;
 
     /* A binding over this file, such as the one bind_proc_pid_auxv()
      * makes for a ptraced tracee, is left alone.  */
-    if (get_sysarg_path(tracee, host_path, reg) < 0
-	|| strcmp(host_path, proc_path) != 0)
-	return;
+    if (strcmp(host_path, proc_path) != 0)
+	return NULL;
 
     if (tracee->auxv_path == NULL) {
 	fd = open(proc_path, O_RDONLY);
 	if (fd < 0)
-	    return;
+	    return NULL;
 	size = read(fd, vectors, sizeof(vectors));
 	(void) close(fd);
 
@@ -137,11 +146,11 @@ static void redirect_own_auxv(Tracee *tracee,
 	 * a truncated copy would be worse than the kernel's own.  */
 	if (size <= 0 || (size_t) size == sizeof(vectors)
 	    || !fix_up_execfn(tracee, vectors, size))
-	    return;
+	    return NULL;
 
 	tracee->auxv_path = (char *) create_temp_file(tracee, "auxv");
 	if (tracee->auxv_path == NULL)
-	    return;
+	    return NULL;
 
 	fd = open(tracee->auxv_path, O_WRONLY);
 	status = (fd < 0 ? -1 : write(fd, vectors, size));
@@ -149,11 +158,35 @@ static void redirect_own_auxv(Tracee *tracee,
 	    (void) close(fd);
 	if (status != size) {
 	    TALLOC_FREE(tracee->auxv_path);
-	    return;
+	    return NULL;
 	}
     }
 
-    (void) set_sysarg_path(tracee, tracee->auxv_path, reg);
+    return tracee->auxv_path;
+}
+
+/**
+ * Make the @reg argument of the current syscall point to a copy of
+ * @tracee's auxiliary vector with AT_EXECFN fixed up, if @user_path
+ * names the tracee's own auxv file and @flags open it for reading
+ * only, see get_own_auxv_path().
+ */
+static void redirect_own_auxv(Tracee *tracee,
+			      const char user_path[PATH_MAX], int flags,
+			      Reg reg)
+{
+    char host_path[PATH_MAX];
+    const char *path;
+
+    if (!is_own_auxv_requested(tracee, user_path, flags))
+	return;
+
+    if (get_sysarg_path(tracee, host_path, reg) < 0)
+	return;
+
+    path = get_own_auxv_path(tracee, host_path);
+    if (path != NULL)
+	(void) set_sysarg_path(tracee, path, reg);
 }
 
 /**
@@ -507,7 +540,7 @@ int translate_syscall_enter(Tracee *tracee)
     case PR_futimesat:
     case PR_mknodat:
 	flags = syscall_number == PR_fchmodat2
-	    ? peek_reg(tracee, CURRENT, SYSARG_3)
+	    ? peek_reg(tracee, CURRENT, SYSARG_4)
 	    : 0;
 	dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 

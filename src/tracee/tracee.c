@@ -203,6 +203,7 @@ Tracee *new_dummy_tracee(TALLOC_CTX *context)
     tracee->heap = talloc_zero(tracee, Heap);
     if (tracee->fs == NULL || tracee->heap == NULL)
 	goto no_mem;
+    tracee->fs->umask = -1;
 
     return tracee;
 
@@ -550,6 +551,8 @@ int new_child(Tracee *parent, word_t clone_flags)
 	child->fs = talloc_zero(child, FileSystemNameSpace);
 	if (child->fs == NULL)
 	    return -ENOMEM;
+
+	child->fs->umask = parent->fs->umask;
 
 	child->fs->cwd = talloc_strdup(child->fs, parent->fs->cwd);
 	if (child->fs->cwd == NULL)

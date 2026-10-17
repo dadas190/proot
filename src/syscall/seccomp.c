@@ -40,6 +40,7 @@
 #include <stddef.h>		/* offsetof(3), */
 #include <stdint.h>		/* uint*_t, UINT*_MAX, */
 #include <assert.h>		/* assert(3), */
+#include <endian.h>		/* __BYTE_ORDER, */
 
 #include "syscall/seccomp.h"
 #include "syscall/notify.h"
@@ -129,14 +130,110 @@ static int add_trace_syscall(struct sock_fprog *program, word_t syscall,
     return 0;
 }
 
+#if defined(NOTIFY_SUPPORTED)
+/**
+ * Append to @program->filter the statements required to notify the
+ * workers about the given @syscall made by a tracee, unless its
+ * argument number @arg has one of the bits of @mask set: notify the
+ * tracer with the given @trace_action then.  This function returns
+ * -errno if an error occurred, otherwise 0.
+ */
+static int add_conditional_syscall(struct sock_fprog *program,
+				   word_t syscall, size_t arg,
+				   uint32_t mask, uint32_t trace_action)
+{
+    /* The lower 32 bits of the argument.  */
+    const size_t arg_offset = offsetof(struct seccomp_data, args)
+	+ arg * sizeof(__u64)
+#if __BYTE_ORDER == __BIG_ENDIAN
+	+ sizeof(__u32)
+#endif
+	;
+    int status;
+
+    /* Sanity check.  */
+    if (syscall > UINT32_MAX || arg_offset > UINT32_MAX)
+	return -ERANGE;
+
+#define LENGTH_CONDITIONAL_SYSCALL 5
+    struct sock_filter statements[LENGTH_CONDITIONAL_SYSCALL] = {
+	/* Compare the accumulator with the expected syscall:
+	 * skip this block if not equal.  */
+	BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0,
+		 LENGTH_CONDITIONAL_SYSCALL - 1),
+
+	/* Load the argument into the accumulator, then check
+	 * the bits of the mask.  */
+	BPF_STMT(BPF_LD + BPF_W + BPF_ABS, arg_offset),
+	BPF_JUMP(BPF_JMP + BPF_JSET + BPF_K, mask, 0, 1),
+
+	/* Notify the tracer if any is set, the workers
+	 * otherwise.  */
+	BPF_STMT(BPF_RET + BPF_K, trace_action),
+	BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF)
+    };
+
+    DEBUG_FILTER("FILTER:     notify if syscall == %ld, unless "
+		 "arg%zd & %x\n", syscall, arg, mask);
+
+    status =
+	add_statements(program, LENGTH_CONDITIONAL_SYSCALL, statements);
+    if (status < 0)
+	return status;
+
+    return 0;
+}
+#endif
+
+/**
+ * Append to @program->filter the statements for the given @syscall,
+ * that is @sysnum: they notify the workers if @notified (see
+ * notify.c), otherwise the tracer with the given @flags.  Only the
+ * number of statements is computed if @program is NULL.  This
+ * function returns -errno if an error occurred, otherwise this
+ * number.
+ */
+static int add_syscall(struct sock_fprog *program, word_t syscall,
+		       Sysnum sysnum, word_t flags, bool notified)
+{
+    uint32_t action = SECCOMP_RET_TRACE + flags;
+    int status;
+
+#if defined(NOTIFY_SUPPORTED)
+    size_t arg;
+    uint32_t mask;
+
+    if (notified && notify_get_condition(sysnum, &arg, &mask)) {
+	if (program == NULL)
+	    return LENGTH_CONDITIONAL_SYSCALL;
+
+	status = add_conditional_syscall(program, syscall, arg, mask,
+					 action);
+	return (status < 0 ? status : LENGTH_CONDITIONAL_SYSCALL);
+    }
+
+    if (notified)
+	action = SECCOMP_RET_USER_NOTIF;
+#else
+    (void) sysnum;
+    (void) notified;
+#endif
+
+    if (program == NULL)
+	return LENGTH_TRACE_SYSCALL;
+
+    status = add_trace_syscall(program, syscall, action);
+    return (status < 0 ? status : LENGTH_TRACE_SYSCALL);
+}
+
 /**
  * Append to @program->filter the statements that allow anything (if
- * unfiltered).  Note that @nb_traced_syscalls is used to make a
- * sanity check.  This function returns -errno if an error occurred,
- * otherwise 0.
+ * unfiltered).  Note that @body_length, the number of statements
+ * added since start_arch_section(), is used to make a sanity check.
+ * This function returns -errno if an error occurred, otherwise 0.
  */
 static int end_arch_section(struct sock_fprog *program,
-			    size_t nb_traced_syscalls)
+			    size_t body_length)
 {
     int status;
 
@@ -153,7 +250,7 @@ static int end_arch_section(struct sock_fprog *program,
 
     /* Sanity check, see start_arch_section().  */
     if (talloc_array_length(program->filter) - program->len
-	!= LENGTH_END_SECTION + nb_traced_syscalls * LENGTH_TRACE_SYSCALL)
+	!= LENGTH_END_SECTION + body_length)
 	return -ERANGE;
 
     return 0;
@@ -161,17 +258,17 @@ static int end_arch_section(struct sock_fprog *program,
 
 /**
  * Append to @program->filter the statements that check the current
- * @architecture.  Note that @nb_traced_syscalls is used to make a
- * sanity check.  This function returns -errno if an error occurred,
+ * @architecture.  Note that @body_length, the number of statements
+ * for the syscalls of this architecture, is used to make a sanity
+ * check.  This function returns -errno if an error occurred,
  * otherwise 0.
  */
 static int start_arch_section(struct sock_fprog *program, uint32_t arch,
-			      size_t nb_traced_syscalls)
+			      size_t body_length)
 {
     const size_t arch_offset = offsetof(struct seccomp_data, arch);
     const size_t syscall_offset = offsetof(struct seccomp_data, nr);
-    const size_t section_length = LENGTH_END_SECTION +
-	nb_traced_syscalls * LENGTH_TRACE_SYSCALL;
+    const size_t section_length = LENGTH_END_SECTION + body_length;
     int status;
 
     /* Sanity checks.  */
@@ -200,7 +297,7 @@ static int start_arch_section(struct sock_fprog *program, uint32_t arch,
     };
 
     DEBUG_FILTER("FILTER: if arch == %ld, up to %zdth statement\n",
-		 arch, nb_traced_syscalls);
+		 arch, body_length);
 
     status = add_statements(program, LENGTH_START_SECTION, statements);
     if (status < 0)
@@ -298,7 +395,9 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums, int *listener)
     size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
 
     struct sock_fprog program = {.len = 0,.filter = NULL };
-    size_t nb_traced_syscalls;
+    size_t body_length;
+    bool notified;
+    int pass;
     size_t i, j, k;
     int status;
 
@@ -310,57 +409,50 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums, int *listener)
     for (i = 0; i < nb_archs; i++) {
 	word_t syscall;
 
-	nb_traced_syscalls = 0;
-
-	/* Pre-compute the number of traced syscalls for this architecture.  */
-	for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
-	    for (k = 0; sysnums[k].value != PR_void; k++) {
-		syscall =
-		    detranslate_sysnum(seccomp_archs[i].abis[j],
-				       sysnums[k].value);
-		if (syscall != SYSCALL_AVOIDER)
-		    nb_traced_syscalls++;
-	    }
-	}
-
-	/* Filter: if handled architecture */
-	status =
-	    start_arch_section(&program, seccomp_archs[i].value,
-			       nb_traced_syscalls);
-	if (status < 0)
-	    goto end;
-
-	for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
-	    for (k = 0; sysnums[k].value != PR_void; k++) {
-		/* Get the architecture specific syscall number.  */
-		syscall =
-		    detranslate_sysnum(seccomp_archs[i].abis[j],
-				       sysnums[k].value);
-		if (syscall == SYSCALL_AVOIDER)
-		    continue;
-
-		/* Filter: trace if handled syscall, or notify the
-		 * workers if they serve it for the native ABI.  */
-#if defined(NOTIFY_SUPPORTED)
-		if (listener != NULL && i == 0
-		    && seccomp_archs[i].abis[j] == ABI_DEFAULT
-		    && notify_is_routed(sysnums[k].value))
-		    status =
-			add_trace_syscall(&program, syscall,
-					  SECCOMP_RET_USER_NOTIF);
-		else
-#endif
-		    status =
-			add_trace_syscall(&program, syscall,
-					  SECCOMP_RET_TRACE +
-					  sysnums[k].flags);
+	/* Pre-compute the number of statements for this
+	 * architecture (first pass), then add them (second pass).  */
+	body_length = 0;
+	for (pass = 0; pass < 2; pass++) {
+	    if (pass == 1) {
+		/* Filter: if handled architecture */
+		status =
+		    start_arch_section(&program, seccomp_archs[i].value,
+				       body_length);
 		if (status < 0)
 		    goto end;
+	    }
+
+	    for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
+		for (k = 0; sysnums[k].value != PR_void; k++) {
+		    /* Get the architecture specific syscall number.  */
+		    syscall =
+			detranslate_sysnum(seccomp_archs[i].abis[j],
+					   sysnums[k].value);
+		    if (syscall == SYSCALL_AVOIDER)
+			continue;
+
+		    /* Filter: trace if handled syscall, or notify
+		     * the workers if they serve it for the native
+		     * ABI.  */
+		    notified = (listener != NULL && i == 0
+				&& seccomp_archs[i].abis[j] == ABI_DEFAULT
+				&& notify_is_routed(sysnums[k].value));
+
+		    status =
+			add_syscall(pass == 0 ? NULL : &program, syscall,
+				    sysnums[k].value, sysnums[k].flags,
+				    notified);
+		    if (status < 0)
+			goto end;
+
+		    if (pass == 0)
+			body_length += status;
+		}
 	    }
 	}
 
 	/* Filter: allow untraced syscalls for this architecture */
-	status = end_arch_section(&program, nb_traced_syscalls);
+	status = end_arch_section(&program, body_length);
 	if (status < 0)
 	    goto end;
     }
@@ -574,11 +666,23 @@ int enable_syscall_filtering(const Tracee *tracee, int *listener)
     }
 
     if (listener != NULL) {
+	FilteredSysnum *notified_sysnums = NULL;
+
 	*listener = -1;
+
+	/* Syscalls only the workers are interested in.  */
+	status =
+	    merge_filtered_sysnums(tracee->ctx, &notified_sysnums,
+				   filtered_sysnums);
+	if (status >= 0)
+	    status =
+		merge_filtered_sysnums(tracee->ctx, &notified_sysnums,
+				       notify_extra_sysnums);
 
 	/* Fall back to the ptrace flow for all syscalls, eg. when
 	 * another filter has a listener already (EBUSY).  */
-	status = set_seccomp_filters(filtered_sysnums, listener);
+	if (status >= 0)
+	    status = set_seccomp_filters(notified_sysnums, listener);
 	if (status >= 0)
 	    return 0;
 
