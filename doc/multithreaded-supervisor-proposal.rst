@@ -293,8 +293,8 @@ Implemented in ``src/syscall/notify.c``:
   ``NEW_LISTENER``, plus ``WAIT_KILLABLE_RECV`` when available),
   hand-off over a ``socketpair`` with ``SCM_RIGHTS``, and fallback to
   the plain ``TRACE`` filter when anything fails.  The fast path is
-  enabled only on x86_64 and arm64, on Linux 5.5 or newer, when no
-  extension is loaded.  ``PROOT_NO_NOTIFY=1`` disables it and
+  enabled only on x86_64 and arm64, on Linux 5.5 or newer, for the
+  syscalls all loaded extensions accept (see below).  ``PROOT_NO_NOTIFY=1`` disables it and
   ``PROOT_NOTIFY_THREADS`` sets the number of workers (default: the
   number of CPUs).  ``-v 1`` reports whether it is enabled, ``-v 3``
   logs each syscall a worker serves.
@@ -318,13 +318,37 @@ Implemented in ``src/syscall/notify.c``:
     ``fchmodat``, ``fchmodat2``, ``chown``, ``lchown``, ``fchownat``,
     ``utimensat`` and ``truncate``.
 
++ Extensions: a syscall is served by a worker only if every loaded
+  extension accepts it (``NOTIFIED_SYSCALL`` event).  Extensions then
+  adjust it with the ``NOTIFY_ENTER`` and ``NOTIFY_EXIT`` events,
+  around the syscall performed by the worker, and their path events
+  run in worker threads too (``notify_current_call()`` replaces the
+  registers of the tracee there).  ``fake_id0`` (``-0``, ``-i``) and
+  ``link2symlink`` (``-l``), the ones proot-distro loads, support it:
+
+  - ``fake_id0``: id swapping for ``chown``, forced success of
+    ``chmod``/``chown``/``mknod`` for root, owner faking in the
+    ``stat`` family, emulation of ``CAP_DAC_OVERRIDE`` during the path
+    translation (modes restored by the worker), and ``getuid``,
+    ``geteuid``, ``getgid``, ``getegid``, ``getresuid``,
+    ``getresgid`` answered from its configuration;
+  - ``link2symlink``: fake hard links for ``link``/``linkat``, link
+    counts for ``unlink``/``unlinkat``/``rename``/``renameat`` and the
+    ``stat`` family.  Workers update the fake links one at a time and
+    translate their paths again first, so that concurrent links
+    behave like with the ptrace flow.
+
+  The other extensions (``kompat``, ``care``, ``portmap``, ``python``)
+  don't, so nothing is served by the workers when one of them is
+  loaded.
 + Workers create files with a umask of 0 and apply the tracee's one,
   which ``umask(2)`` calls keep up to date (they are reported to the
   workers for that purpose only, then performed by the kernel).
-+ Calls with an empty path (``AT_EMPTY_PATH``), and calls whose paths
-  need no translation at all (eg. ``/dev/null`` when ``/dev`` is bound
-  to itself), are passed back to the kernel unchanged (``CONTINUE``),
-  which also covers what only the tracee can resolve (``/proc/self``).
++ Calls with an empty path (``AT_EMPTY_PATH``), calls whose paths need
+  no translation at all (eg. ``/dev/null`` when ``/dev`` is bound to
+  itself) when no extension is loaded, and what only the tracee can
+  resolve (``/proc/self``) are passed back to the kernel unchanged
+  (``CONTINUE``).
 + Locking: the event loop holds a writer-preferring read-write lock
   while it handles an event, the workers hold it for reading while they
   translate, so translations run concurrently.  ``proc.c`` no longer
@@ -353,6 +377,16 @@ same, 8 instances in parallel                       20.2 s      10.9 s
 ``make -j4`` of PRoot itself                        5.1 s       4.0 s
 ==================================================  ==========  ==========
 
+With ``-0 --link2symlink``, like proot-distro:
+
+==================================================  ==========  ==========
+Workload                                            Before      After
+==================================================  ==========  ==========
+``find -printf '%s %m'`` over ``/usr``, 1 instance  10.5 s      4.8 s
+same, 8 instances in parallel                       42.6 s      16.7 s
+``make -j4`` of PRoot itself                        5.8 s       4.2 s
+==================================================  ==========  ==========
+
 Findings that change the plan:
 
 + A session has a single notification listener (the kernel refuses a
@@ -366,9 +400,11 @@ Findings that change the plan:
   the ``stat`` family alone: process creation and ``execve``, which
   remain on the single ptrace thread, are the next bottleneck.
 
-Not done yet: Phase 4 (``fake_id0`` and ``link2symlink``, so
-proot-distro sessions, which load both, don't benefit yet), the less
-common syscalls (``*xattr``, ``utime``/``utimes``/``futimesat``,
+Fixed along the way: ``link2symlink`` wrote a ``struct stat`` into the
+``struct statx`` of ``statx(2)`` callers (wrong size and inode for fake
+hard links), and read an uninitialized mode when ``lstat(2)`` failed.
+
+Not done yet: the less common syscalls (``*xattr``, ``utime``/``utimes``/``futimesat``,
 ``statfs``, ``bind``/``connect``...) and testing on Android.
 
 Open questions

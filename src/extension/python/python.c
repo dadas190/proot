@@ -208,6 +208,12 @@ int python_callback(Extension *extension, ExtensionEvent event,
 	    extension->filtered_sysnums = filtered_sysnums;
 	}
 	break;
+    case NOTIFIED_SYSCALL:
+	/* Python callbacks see syscalls through the ptrace flow
+	 * only.  */
+	res = 0;
+	break;
+
     default:
 	res = python_callback_func_wrapper(extension, event, data1, data2);
     }

@@ -94,6 +94,15 @@ check-test-constructor-runs-once.c: test-constructor-runs-once
 check-test-thread-execve-nyi.c: test-thread-execve-nyi
 	$(call check_c,$<,$(PROOT) ./$<)
 
+# Served by the seccomp notification workers with the extensions too.
+check-test-stat-access-concurrent.c: $(ROOTFS)/bin/test-stat-access-concurrent setup
+	$(call check_c,test-stat-access-concurrent,$(PROOT) -b /proc -r $(ROOTFS) /bin/test-stat-access-concurrent)
+	$(call check_c,test-stat-access-concurrent,$(PROOT) -0 --link2symlink -b /proc -r $(ROOTFS) /bin/test-stat-access-concurrent)
+
+check-test-file-ops-concurrent.c: $(ROOTFS)/bin/test-file-ops-concurrent setup
+	$(call check_c,test-file-ops-concurrent,$(PROOT) -b /proc -r $(ROOTFS) /bin/test-file-ops-concurrent)
+	$(call check_c,test-file-ops-concurrent,$(PROOT) -0 -b /proc -r $(ROOTFS) /bin/test-file-ops-concurrent)
+
 check-test-bug-182.c: test-bug-182
 	$(call check_c,$<,$(PROOT) ./$<)
 

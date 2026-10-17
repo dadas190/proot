@@ -42,6 +42,8 @@
 #include "tracee/mem.h"
 #include "execve/auxv.h"
 #include "path/binding.h"
+#include "build.h"
+#include "syscall/notify.h"
 #include "arch.h"
 
 typedef struct {
@@ -152,8 +154,10 @@ static int restore_mode(ModifiedNode *node)
 static void override_permissions(const Tracee *tracee, const char *path,
 				 bool is_final)
 {
+    NotifiedCall *call = notify_current_call();
     ModifiedNode *node;
     struct stat perms;
+    mode_t restored_mode;
     mode_t new_mode;
     int status;
 
@@ -176,22 +180,23 @@ static void override_permissions(const Tracee *tracee, const char *path,
     if (new_mode == (perms.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO)))
 	return;
 
-    node = talloc_zero(tracee->ctx, ModifiedNode);
-    if (node == NULL)
-	return;
-
     if (!is_final) {
 	/* Restore the previous mode of any non final components.  */
-	node->mode = perms.st_mode;
+	restored_mode = perms.st_mode;
     } else {
-	switch (get_sysnum(tracee, ORIGINAL)) {
+	Sysnum sysnum = (call != NULL ? call->sysnum
+			 : get_sysnum(tracee, ORIGINAL));
+
+	switch (sysnum) {
 	    /* For chmod syscalls: restore the new mode of the final component.  */
 	case PR_chmod:
-	    node->mode = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	    restored_mode = (call != NULL ? call->args[1]
+			     : peek_reg(tracee, ORIGINAL, SYSARG_2));
 	    break;
 
 	case PR_fchmodat:
-	    node->mode = peek_reg(tracee, ORIGINAL, SYSARG_3);
+	    restored_mode = (call != NULL ? call->args[2]
+			     : peek_reg(tracee, ORIGINAL, SYSARG_3));
 	    break;
 
 	    /* For stat syscalls: don't touch the mode of the final component.  */
@@ -210,21 +215,33 @@ static void override_permissions(const Tracee *tracee, const char *path,
 
 	    /* Otherwise: restore the previous mode of the final component.  */
 	default:
-	    node->mode = perms.st_mode;
+	    restored_mode = perms.st_mode;
 	    break;
 	}
     }
 
-    node->path = talloc_strdup(node, path);
-    if (node->path == NULL) {
-	/* Keep only consistent nodes.  */
-	TALLOC_FREE(node);
-	return;
-    }
+    /* A seccomp notification worker restores the modes once it has
+     * performed the syscall, talloc can't be used there.  */
+    if (call != NULL) {
+	if (notify_defer_mode(call, path, restored_mode) < 0)
+	    return;
+    } else {
+	node = talloc_zero(tracee->ctx, ModifiedNode);
+	if (node == NULL)
+	    return;
 
-    /* The mode restoration works because Talloc destructors are
-     * called in reverse order.  */
-    talloc_set_destructor(node, restore_mode);
+	node->mode = restored_mode;
+	node->path = talloc_strdup(node, path);
+	if (node->path == NULL) {
+	    /* Keep only consistent nodes.  */
+	    TALLOC_FREE(node);
+	    return;
+	}
+
+	/* The mode restoration works because Talloc destructors are
+	 * called in reverse order.  */
+	talloc_set_destructor(node, restore_mode);
+    }
 
     /* @path was already canonicalized and stat'd above under the
      * tracee's translated view; this mirrors the path-based access
@@ -775,6 +792,175 @@ static int adjust_elf_auxv(Tracee *tracee, Config *config)
 }
 
 /**
+ * Check whether the syscall @sysnum can be served by a seccomp
+ * notification worker, see handle_notify_enter() and
+ * handle_notify_exit().
+ */
+static bool is_notified_syscall(Sysnum sysnum)
+{
+    size_t i;
+
+    switch (sysnum) {
+    case PR_chmod:
+    case PR_chown:
+    case PR_fchmodat:
+    case PR_fchownat:
+    case PR_getegid:
+    case PR_geteuid:
+    case PR_getgid:
+    case PR_getresgid:
+    case PR_getresuid:
+    case PR_getuid:
+    case PR_lchown:
+    case PR_lstat:
+    case PR_mknod:
+    case PR_mknodat:
+    case PR_newfstatat:
+    case PR_stat:
+    case PR_statx:
+	return true;
+
+    default:
+	/* Syscalls this extension doesn't handle are fine.  */
+	for (i = 0; filtered_sysnums[i].value != PR_void; i++) {
+	    if (filtered_sysnums[i].value == sysnum)
+		return false;
+	}
+	return true;
+    }
+}
+
+/**
+ * Adjust the syscall @call a worker is about to perform on behalf of
+ * the tracee, according to @config, like handle_sysenter_end() does
+ * in the ptrace flow.  This function returns > 0 if the syscall is
+ * emulated, -errno if an error occurred, otherwise 0.
+ */
+static int handle_notify_enter(NotifiedCall *call, const Config *config)
+{
+    uint32_t ids[3];
+    size_t i;
+    int status;
+
+    switch (call->sysnum) {
+    case PR_chown:
+    case PR_lchown:
+    case PR_fchownat:{
+	    const size_t uid_arg = (call->sysnum == PR_fchownat ? 2 : 1);
+
+	    /* Swap actual and emulated ids to get a chance of
+	     * success.  */
+	    if ((uid_t) call->args[uid_arg] == config->ruid)
+		call->args[uid_arg] = getuid();
+	    if ((gid_t) call->args[uid_arg + 1] == config->rgid)
+		call->args[uid_arg + 1] = getgid();
+	    return 0;
+	}
+
+    case PR_getuid:
+	call->result = config->ruid;
+	return 1;
+
+    case PR_getgid:
+	call->result = config->rgid;
+	return 1;
+
+    case PR_geteuid:
+	call->result = config->euid;
+	return 1;
+
+    case PR_getegid:
+	call->result = config->egid;
+	return 1;
+
+    case PR_getresuid:
+    case PR_getresgid:
+	if (call->sysnum == PR_getresuid) {
+	    ids[0] = config->ruid;
+	    ids[1] = config->euid;
+	    ids[2] = config->suid;
+	} else {
+	    ids[0] = config->rgid;
+	    ids[1] = config->egid;
+	    ids[2] = config->sgid;
+	}
+
+	for (i = 0; i < 3; i++) {
+	    status = notify_write_memory(call->pid, call->args[i], &ids[i],
+					 sizeof(ids[i]));
+	    if (status < 0)
+		return status;
+	}
+
+	call->result = 0;
+	return 1;
+
+    default:
+	return 0;
+    }
+}
+
+/**
+ * Adjust the result of the syscall @call a worker has performed on
+ * behalf of the tracee, according to @config, like
+ * handle_sysexit_end() does in the ptrace flow.
+ */
+static void handle_notify_exit(NotifiedCall *call, const Config *config)
+{
+    switch (call->sysnum) {
+    case PR_mknod:
+    case PR_mknodat:
+    case PR_chmod:
+    case PR_chown:
+    case PR_lchown:
+    case PR_fchmodat:
+    case PR_fchownat:
+	/* Force success if the tracee was supposed to have the
+	 * capability.  */
+	if (call->result == -EPERM && config->euid == 0)	/* TODO: || HAS_CAP(...) */
+	    call->result = 0;
+	return;
+
+    case PR_stat:
+    case PR_lstat:
+    case PR_newfstatat:
+    case PR_statx:{
+	    off_t uid_offset;
+	    off_t gid_offset;
+	    uint32_t id;
+
+	    /* Override only if it succeed.  */
+	    if (call->result != 0 || call->data == NULL)
+		return;
+
+	    if (call->sysnum == PR_statx) {
+		uid_offset = OFFSETOF_STATX_UID;
+		gid_offset = OFFSETOF_STATX_GID;
+	    } else {
+		uid_offset = offsetof(struct stat, st_uid);
+		gid_offset = offsetof(struct stat, st_gid);
+	    }
+
+	    /* Override only if the file is owned by the current
+	     * user.  */
+	    memcpy(&id, (uint8_t *) call->data + uid_offset, sizeof(id));
+	    if (id == getuid())
+		memcpy((uint8_t *) call->data + uid_offset, &config->suid,
+		       sizeof(id));
+
+	    memcpy(&id, (uint8_t *) call->data + gid_offset, sizeof(id));
+	    if (id == getgid())
+		memcpy((uint8_t *) call->data + gid_offset, &config->sgid,
+		       sizeof(id));
+	    return;
+	}
+
+    default:
+	return;
+    }
+}
+
+/**
  * Handler for this @extension.  It is triggered each time an @event
  * occurred.  See ExtensionEvent for the meaning of @data1 and @data2.
  */
@@ -865,6 +1051,20 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event,
 						   Config);
 
 	    return handle_sysenter_end(tracee, config);
+	}
+
+    case NOTIFIED_SYSCALL:
+	return (is_notified_syscall((Sysnum) data1) ? 1 : 0);
+
+    case NOTIFY_ENTER:{
+	    const Config *config = extension->config;
+	    return handle_notify_enter((NotifiedCall *) data1, config);
+	}
+
+    case NOTIFY_EXIT:{
+	    const Config *config = extension->config;
+	    handle_notify_exit((NotifiedCall *) data1, config);
+	    return 0;
 	}
 
     case SYSCALL_EXIT_END:{

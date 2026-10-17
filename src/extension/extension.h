@@ -135,6 +135,35 @@ typedef enum {
     /* Called for every already opened file descriptor:
      * "(const char *)" data1" is the path, "(int) data2" is the file descriptor" */
     ALREADY_OPENED_FD,
+
+    /* Ask whether the syscall "(Sysnum) data1" can be served by a
+     * seccomp notification worker (see syscall/notify.c) instead of
+     * the ptrace flow, that is, whether this extension handles it
+     * with the NOTIFY_ENTER and NOTIFY_EXIT events, or doesn't care
+     * about it.  Its path events (GUEST_PATH, HOST_PATH,
+     * TRANSLATED_PATH) are then called from a worker thread too,
+     * concurrently with other workers: they must not use the
+     * registers of the tracee nor talloc, see
+     * notify_current_call().  The syscall is served by a worker
+     * only if all extensions return > 0.  */
+    NOTIFIED_SYSCALL,
+
+    /* A worker is about to perform the syscall "(NotifiedCall *)
+     * data1" on behalf of the tracee, its paths are translated
+     * already.  The big lock is held for reading: the extension
+     * must not use the registers of the tracee nor talloc.  If the
+     * extension returns > 0, then the worker doesn't perform the
+     * syscall and uses data1->result instead.  If the extension
+     * returns < 0, then the worker reports this errno to the
+     * tracee.  */
+    NOTIFY_ENTER,
+
+    /* A worker has performed the syscall "(NotifiedCall *) data1"
+     * on behalf of the tracee: data1->result is its result, and
+     * data1->data its output, if any, about to be copied in the
+     * memory of the tracee.  Both can be modified.  Same
+     * constraints as NOTIFY_ENTER.  */
+    NOTIFY_EXIT,
 } ExtensionEvent;
 
 #define CLONE_RECONF ((word_t) -1)

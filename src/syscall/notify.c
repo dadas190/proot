@@ -171,10 +171,25 @@ static const Sysnum routed_open_sysnums[] = {
     PR_void
 };
 
-/* Whether SECCOMP_ADDFD_FLAG_SEND (Linux 5.14) is available.  This
- * is computed by notify_wanted(), before the first tracee is
- * created.  */
-static bool can_send_fd = false;
+/* Syscalls PRoot doesn't handle by itself but that an extension can
+ * emulate in a worker (fake_id0), otherwise the kernel performs them
+ * as-is.  */
+static const Sysnum routed_emulated_sysnums[] = {
+    PR_getegid,
+    PR_geteuid,
+    PR_getgid,
+    PR_getresgid,
+    PR_getresuid,
+    PR_getuid,
+    PR_void
+};
+
+/* Syscalls served by the workers, and the other way around, indexed
+ * by their number in the native ABI.  These are computed by
+ * notify_wanted(), before the first tracee is created.  */
+static bool routed[PR_NB_SYSNUM];
+#define MAX_SYSCALL_NUMBER 1024
+static Sysnum routed_numbers[MAX_SYSCALL_NUMBER];
 
 static struct seccomp_notif_sizes sizes;
 
@@ -222,23 +237,83 @@ static bool is_kernel_at_least(int major, int minor)
 }
 
 /**
+ * Check whether all extensions of @tracee accept that @sysnum is
+ * served by a worker, see NOTIFIED_SYSCALL.
+ */
+static bool accepted_by_extensions(const Tracee *tracee, Sysnum sysnum)
+{
+    Extension *extension;
+
+    if (tracee->extensions == NULL)
+	return true;
+
+    LIST_FOREACH(extension, tracee->extensions, link) {
+	if (extension->callback(extension, NOTIFIED_SYSCALL,
+				(intptr_t) sysnum, 0) <= 0)
+	    return false;
+    }
+
+    return true;
+}
+
+/**
+ * Mark the syscalls of @table as served by the workers, if the
+ * extensions of @tracee accept it.  This function returns the number
+ * of syscalls marked.
+ */
+static size_t route(const Tracee *tracee, const Sysnum *table)
+{
+    size_t count = 0;
+    word_t number;
+    size_t i;
+
+    for (i = 0; table[i] != PR_void; i++) {
+	number = detranslate_sysnum(ABI_DEFAULT, table[i]);
+	if (number == SYSCALL_AVOIDER || number >= MAX_SYSCALL_NUMBER
+	    || !accepted_by_extensions(tracee, table[i]))
+	    continue;
+
+	routed[table[i]] = true;
+	routed_numbers[number] = table[i];
+	count++;
+    }
+
+    return count;
+}
+
+/**
  * Check whether the seccomp filter of @tracee should report the
- * routed syscalls through a notification file descriptor.
+ * routed syscalls through a notification file descriptor, and
+ * compute which ones.
  */
 bool notify_wanted(const Tracee *tracee)
 {
+    Sysnum extra_sysnums[16];
+    size_t count = 0;
+    size_t i;
+
     if (getenv("PROOT_NO_SECCOMP") != NULL
 	|| getenv("PROOT_NO_NOTIFY") != NULL)
 	return false;
 
-    /* Extensions see syscalls through the ptrace flow only.  */
-    if (tracee->extensions != NULL && !LIST_EMPTY(tracee->extensions))
+    /* SECCOMP_USER_NOTIF_FLAG_CONTINUE appeared in Linux 5.5.  */
+    if (!is_kernel_at_least(5, 5))
 	return false;
 
-    can_send_fd = is_kernel_at_least(5, 14);
+    for (i = 0; notify_extra_sysnums[i].value != PR_void
+	 && i < sizeof(extra_sysnums) / sizeof(Sysnum) - 1; i++)
+	extra_sysnums[i] = notify_extra_sysnums[i].value;
+    extra_sysnums[i] = PR_void;
 
-    /* SECCOMP_USER_NOTIF_FLAG_CONTINUE appeared in Linux 5.5.  */
-    return is_kernel_at_least(5, 5);
+    count += route(tracee, routed_sysnums);
+    count += route(tracee, routed_emulated_sysnums);
+    count += route(tracee, extra_sysnums);
+
+    /* SECCOMP_ADDFD_FLAG_SEND appeared in Linux 5.14.  */
+    if (is_kernel_at_least(5, 14))
+	count += route(tracee, routed_open_sysnums);
+
+    return (count > 0);
 }
 
 /**
@@ -246,24 +321,7 @@ bool notify_wanted(const Tracee *tracee)
  */
 bool notify_is_routed(Sysnum sysnum)
 {
-    size_t i;
-
-    for (i = 0; routed_sysnums[i] != PR_void; i++) {
-	if (routed_sysnums[i] == sysnum)
-	    return true;
-    }
-
-    for (i = 0; can_send_fd && routed_open_sysnums[i] != PR_void; i++) {
-	if (routed_open_sysnums[i] == sysnum)
-	    return true;
-    }
-
-    for (i = 0; notify_extra_sysnums[i].value != PR_void; i++) {
-	if (notify_extra_sysnums[i].value == sysnum)
-	    return true;
-    }
-
-    return false;
+    return (sysnum < PR_NB_SYSNUM && routed[sysnum]);
 }
 
 /**
@@ -298,25 +356,10 @@ bool notify_get_condition(Sysnum sysnum, size_t *arg, uint32_t *mask)
  */
 static Sysnum find_routed_sysnum(int number)
 {
-    const Sysnum *tables[] = { routed_sysnums, routed_open_sysnums };
-    size_t i;
-    size_t j;
+    if (number < 0 || number >= MAX_SYSCALL_NUMBER)
+	return PR_void;
 
-    for (i = 0; notify_extra_sysnums[i].value != PR_void; i++) {
-	if (detranslate_sysnum(ABI_DEFAULT, notify_extra_sysnums[i].value)
-	    == (word_t) number)
-	    return notify_extra_sysnums[i].value;
-    }
-
-    for (i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
-	for (j = 0; tables[i][j] != PR_void; j++) {
-	    if (detranslate_sysnum(ABI_DEFAULT, tables[i][j])
-		== (word_t) number && notify_is_routed(tables[i][j]))
-		return tables[i][j];
-	}
-    }
-
-    return PR_void;
+    return routed_numbers[number];
 }
 
 /**
@@ -530,39 +573,63 @@ typedef enum {
     DROP,			/* Answered already, or the tracee is gone.  */
 } Action;
 
-/* A path argument of a routed syscall.  */
-typedef struct {
-    int dirfd;
-    word_t address;
-    bool deref_final;
-    char user[PATH_MAX];
-    char host[PATH_MAX];
-} PathArg;
+/* The syscall the current worker thread is handling, if any.  */
+static __thread NotifiedCall *current_call = NULL;
 
-/* A routed syscall being handled by a worker.  */
-typedef struct {
-    const struct seccomp_notif *request;
-    const __u64 *args;
-    Sysnum sysnum;
+/**
+ * Return the syscall the calling worker thread is serving, or NULL if
+ * this is not a worker thread.  Extensions use it in their path events
+ * instead of the registers of the tracee.
+ */
+NotifiedCall *notify_current_call(void)
+{
+    return current_call;
+}
 
-    /* PathArg arguments, translated like the ptrace flow does in
-     * translate_syscall_enter().  */
-    size_t nb_paths;
-    PathArg paths[2];
+/**
+ * Restore the mode of @path to @mode once the worker has performed
+ * @call, like a talloc destructor attached to tracee->ctx in the
+ * ptrace flow.  Modes are restored in the reverse order.  This
+ * function returns -errno if an error occurred, otherwise 0.
+ */
+int notify_defer_mode(NotifiedCall *call, const char *path, mode_t mode)
+{
+    char *copy;
 
-    /* AT_* or O_* flags of the syscall.  */
-    int flags;
+    if (call->nb_modes >= NOTIFY_MAX_MODES)
+	return -ENOMEM;
 
-    /* The result has to be detranslated, so the kernel can't run
-     * this syscall as-is even when its paths need no translation.  */
-    bool detranslated;
+    copy = strdup(path);
+    if (copy == NULL)
+	return -ENOMEM;
 
-    /* Translating needs the big lock for writing.  */
-    bool exclusive;
+    call->modes[call->nb_modes].path = copy;
+    call->modes[call->nb_modes].mode = mode;
+    call->nb_modes++;
 
-    /* Umask of the tracee, or -1 if unknown.  */
-    int umask;
-} Call;
+    return 0;
+}
+
+static void restore_modes(NotifiedCall *call)
+{
+    while (call->nb_modes > 0) {
+	call->nb_modes--;
+	(void) chmod(call->modes[call->nb_modes].path,
+		     call->modes[call->nb_modes].mode);
+	free(call->modes[call->nb_modes].path);
+    }
+}
+
+/**
+ * Copy @size bytes from @data to @address in the memory of the tracee
+ * @pid.  This function returns -errno if an error occurred, otherwise
+ * 0.
+ */
+int notify_write_memory(pid_t pid, word_t address, const void *data,
+			size_t size)
+{
+    return write_remote_data(pid, address, data, size);
+}
 
 /**
  * Check whether @path designates the calling process itself, ie. a
@@ -589,6 +656,11 @@ static bool is_open(Sysnum sysnum)
 {
     return (sysnum == PR_open || sysnum == PR_openat
 	    || sysnum == PR_creat);
+}
+
+static bool has_extensions(const Tracee *tracee)
+{
+    return (tracee->extensions != NULL && !LIST_EMPTY(tracee->extensions));
 }
 
 /**
@@ -639,12 +711,11 @@ static Tracee *lock_tracee(pid_t pid, bool exclusive)
  * Translate the paths of @call for the tracee that made it.  This
  * function returns CONTINUE if PRoot already translated this syscall
  * at a ptrace stop, or if the kernel can run it as-is.  Otherwise it
- * returns REPLY with @response->error set to -errno if the
- * translation failed.  On success, the big lock is still held and
- * the tracee is put in @locked_tracee: the caller has to unlock().
+ * returns REPLY with @call->result set to -errno if the translation
+ * failed.  On success, the big lock is still held and the tracee is
+ * put in @locked_tracee: the caller has to unlock().
  */
-static Action translate(Call *call, struct seccomp_notif_resp *response,
-			Tracee **locked_tracee)
+static Action translate(NotifiedCall *call, Tracee **locked_tracee)
 {
     const struct seccomp_notif *request = call->request;
     bool identical = true;
@@ -654,9 +725,9 @@ static Action translate(Call *call, struct seccomp_notif_resp *response,
     int status = 0;
     size_t i;
 
-    tracee = lock_tracee(request->pid, call->exclusive);
+    tracee = lock_tracee(call->pid, call->exclusive);
     if (tracee == NULL) {
-	response->error = -ENOSYS;
+	call->result = -ENOSYS;
 	return REPLY;
     }
 
@@ -680,8 +751,11 @@ static Action translate(Call *call, struct seccomp_notif_resp *response,
 	    tracee->notify.valid = false;
     }
 
+    /* Path events of the extensions use it.  */
+    current_call = call;
+
     for (i = 0; action == REPLY && i < call->nb_paths; i++) {
-	PathArg *path = &call->paths[i];
+	NotifiedPath *path = &call->paths[i];
 
 	/* Like the ptrace flow, an empty path is left as-is.  */
 	if (path->user[0] == '\0') {
@@ -709,12 +783,13 @@ static Action translate(Call *call, struct seccomp_notif_resp *response,
 	}
     }
 
-    /* The kernel would get the very same paths with the ptrace
-     * flow: it can do the job in the tracee itself, which also
-     * covers what only the tracee can resolve ("/proc/self").  */
+    /* The kernel would get the very same arguments with the ptrace
+     * flow: it can do the job in the tracee itself, unless an
+     * extension has something to do with it.  What only the tracee
+     * can resolve ("/proc/self") has to be done there anyway.  */
     if (action == REPLY && status >= 0 && identical
-	&& (!call->detranslated
-	    || is_proc_self(call->paths[0].host)))
+	&& ((!call->detranslated && !has_extensions(tracee))
+	    || (call->nb_paths > 0 && is_proc_self(call->paths[0].host))))
 	action = CONTINUE;
 
     VERBOSE(tracee, 3, "vpid %" PRIu64 ": syscall %d %s by a worker",
@@ -726,10 +801,13 @@ static Action translate(Call *call, struct seccomp_notif_resp *response,
 	return REPLY;
     }
 
+    /* Modes changed by the extensions are restored right now.  */
+    restore_modes(call);
+    current_call = NULL;
     unlock();
 
     if (status < 0)
-	response->error = status;
+	call->result = status;
 
     return action;
 }
@@ -741,10 +819,9 @@ static Action translate(Call *call, struct seccomp_notif_resp *response,
  * @address in the memory of the tracee.  The caller holds the big
  * lock.
  */
-static void emulate_readlink(Tracee *tracee,
-			     const struct seccomp_notif *request,
+static void emulate_readlink(Tracee *tracee, NotifiedCall *call,
 			     const char host_path[PATH_MAX], word_t address,
-			     size_t size, struct seccomp_notif_resp *response)
+			     size_t size)
 {
     char referee[PATH_MAX];
     size_t max_size;
@@ -753,7 +830,7 @@ static void emulate_readlink(Tracee *tracee,
 
     length = readlink(host_path, referee, sizeof(referee) - 1);
     if (length < 0) {
-	response->error = -errno;
+	call->result = -errno;
 	return;
     }
     referee[length] = '\0';
@@ -762,7 +839,7 @@ static void emulate_readlink(Tracee *tracee,
 
     status = detranslate_path(tracee, referee, host_path);
     if (status < 0) {
-	response->error = status;
+	call->result = status;
 	return;
     }
 
@@ -770,11 +847,11 @@ static void emulate_readlink(Tracee *tracee,
      * size of the buffer like the kernel does.  */
     if (status == 0) {
 	length = ((size_t) length < size ? (size_t) length : size);
-	status = write_remote_data(request->pid, address, referee, length);
+	status = write_remote_data(call->pid, address, referee, length);
 	if (status < 0)
-	    response->error = status;
+	    call->result = status;
 	else
-	    response->val = length;
+	    call->result = length;
 	return;
     }
 
@@ -782,17 +859,17 @@ static void emulate_readlink(Tracee *tracee,
      * detranslated target fits.  */
     if ((size_t) status < max_size) {
 	length = status - 1;
-	status = write_remote_data(request->pid, address, referee, status);
+	status = write_remote_data(call->pid, address, referee, status);
     } else {
 	length = max_size;
 	status =
-	    write_remote_data(request->pid, address, referee, max_size);
+	    write_remote_data(call->pid, address, referee, max_size);
     }
 
     if (status < 0)
-	response->error = status;
+	call->result = status;
     else
-	response->val = length;
+	call->result = length;
 }
 
 /* PRoot's own umask, used when the tracee's can't be read.  */
@@ -830,12 +907,12 @@ static mode_t read_umask(pid_t pid)
  * files with a umask of 0, so they have to apply the tracee's one by
  * themselves.
  */
-static mode_t get_umask(const Call *call)
+static mode_t get_umask(const NotifiedCall *call)
 {
     if (call->umask >= 0)
 	return call->umask;
 
-    return read_umask(call->request->pid);
+    return read_umask(call->pid);
 }
 
 #if defined(SECCOMP_IOCTL_NOTIF_ADDFD)
@@ -846,11 +923,11 @@ static mode_t get_umask(const Call *call)
 /**
  * Install @fd in the tracee that made the notification @id, as the
  * result of its syscall, then close it.  This function returns DROP
- * if the notification was answered, otherwise REPLY with
- * @response->error set.
+ * if the notification was answered, otherwise REPLY with @result set
+ * to -errno.
  */
 static Action send_fd(int listener, __u64 id, int fd, bool cloexec,
-		      struct seccomp_notif_resp *response)
+		      long *result)
 {
     struct seccomp_notif_addfd addfd;
     int status;
@@ -871,7 +948,7 @@ static Action send_fd(int listener, __u64 id, int fd, bool cloexec,
 	return DROP;
 
     /* EMFILE for instance.  */
-    response->error = -error;
+    *result = -error;
     return REPLY;
 }
 
@@ -889,6 +966,7 @@ static void *blocking_open(void *argument)
     BlockingOpen *blocking = argument;
     struct seccomp_notif_resp *response;
     Action action = REPLY;
+    long result = 0;
     int fd;
 
     response = calloc(1, sizes.seccomp_notif_resp);
@@ -900,14 +978,16 @@ static void *blocking_open(void *argument)
 
     fd = open(blocking->path, blocking->flags | O_CLOEXEC, blocking->mode);
     if (fd < 0)
-	response->error = -errno;
+	result = -errno;
     else
 	action = send_fd(blocking->listener, blocking->id, fd,
-			 (blocking->flags & O_CLOEXEC) != 0, response);
+			 (blocking->flags & O_CLOEXEC) != 0, &result);
 
-    if (action == REPLY)
+    if (action == REPLY) {
+	response->error = result;
 	(void) ioctl(blocking->listener, SECCOMP_IOCTL_NOTIF_SEND,
 		     response);
+    }
 
     free(response);
     free(blocking);
@@ -920,9 +1000,9 @@ static void *blocking_open(void *argument)
  * until another tracee does something, so it is done by a thread of
  * its own rather than tying up a worker.
  */
-static Action open_file(int listener, const Call *call, mode_t mode,
-			struct seccomp_notif_resp *response)
+static Action open_file(int listener, NotifiedCall *call, mode_t mode)
 {
+    const struct seccomp_notif *request = call->request;
     const char *path = call->paths[0].host;
     const int flags = call->flags;
     BlockingOpen *blocking;
@@ -937,19 +1017,19 @@ static Action open_file(int listener, const Call *call, mode_t mode,
 	    || S_ISBLK(stat_buffer.st_mode))) {
 	blocking = calloc(1, sizeof(BlockingOpen));
 	if (blocking == NULL) {
-	    response->error = -ENOMEM;
+	    call->result = -ENOMEM;
 	    return REPLY;
 	}
 
 	blocking->listener = listener;
-	blocking->id = call->request->id;
+	blocking->id = request->id;
 	blocking->flags = flags;
 	blocking->mode = mode;
 	strcpy(blocking->path, path);
 
 	if (pthread_create(&thread, NULL, blocking_open, blocking) != 0) {
 	    free(blocking);
-	    response->error = -EAGAIN;
+	    call->result = -EAGAIN;
 	    return REPLY;
 	}
 	(void) pthread_detach(thread);
@@ -958,12 +1038,12 @@ static Action open_file(int listener, const Call *call, mode_t mode,
 
     fd = open(path, flags | O_CLOEXEC, mode);
     if (fd < 0) {
-	response->error = -errno;
+	call->result = -errno;
 	return REPLY;
     }
 
-    return send_fd(listener, call->request->id, fd,
-		   (flags & O_CLOEXEC) != 0, response);
+    return send_fd(listener, request->id, fd, (flags & O_CLOEXEC) != 0,
+		   &call->result);
 }
 #endif				/* defined(SECCOMP_IOCTL_NOTIF_ADDFD) */
 
@@ -998,12 +1078,13 @@ static long link_descriptor(pid_t pid, int fd, const char *new_path,
 /**
  * Fill @call according to @call->sysnum and @call->args, the way
  * translate_syscall_enter() reads the arguments of this syscall.
+ * This function returns false if this syscall is unknown.
  */
-static void decode(Call *call)
+static bool decode(NotifiedCall *call)
 {
-    const __u64 *args = call->args;
-    PathArg *path0 = &call->paths[0];
-    PathArg *path1 = &call->paths[1];
+    const uint64_t *args = call->args;
+    NotifiedPath *path0 = &call->paths[0];
+    NotifiedPath *path1 = &call->paths[1];
 
 #define SET_PATH(path, dirfd_, address_, deref_final_) do {	\
 		(path)->dirfd = (dirfd_);			\
@@ -1133,12 +1214,21 @@ static void decode(Call *call)
 	SET_PATH(path0, (int) args[1], args[2], false);
 	break;
 
-    default:
+    case PR_getegid:
+    case PR_geteuid:
+    case PR_getgid:
+    case PR_getresgid:
+    case PR_getresuid:
+    case PR_getuid:
 	call->nb_paths = 0;
 	break;
+
+    default:
+	return false;
     }
 
 #undef SET_PATH
+    return true;
 }
 
 /**
@@ -1146,7 +1236,7 @@ static void decode(Call *call)
  * syscall is one of notify_extra_sysnums[].  This function returns
  * false if @call has to be performed by a worker.
  */
-static bool notify_take_note(const Call *call)
+static bool notify_take_note(const NotifiedCall *call)
 {
     Tracee *tracee;
 
@@ -1156,7 +1246,7 @@ static bool notify_take_note(const Call *call)
     /* Whatever the state of the tracee, even under ptrace
      * emulation.  The file-system name-space might be shared by
      * other tracees (CLONE_FS), hence the write lock.  */
-    tracee = lock_tracee(call->request->pid, true);
+    tracee = lock_tracee(call->pid, true);
     if (tracee != NULL) {
 	tracee->fs->umask = (int) (call->args[0] & 0777);
 	unlock();
@@ -1167,20 +1257,19 @@ static bool notify_take_note(const Call *call)
 
 /**
  * Perform @call on behalf of the tracee, once its paths are
- * translated, and fill @response accordingly.
+ * translated: put its result in @call->result and its output in
+ * @buffer, which @call->data then points to.  This function returns
+ * DROP if the notification was answered already, CONTINUE if the
+ * kernel has to perform this syscall as-is.
  */
-static Action perform(int listener, Call *call, const char *target,
-		      struct seccomp_notif_resp *response)
+static Action perform(int listener, NotifiedCall *call, const char *target,
+		      uint8_t *buffer)
 {
-    const __u64 *args = call->args;
-    const pid_t pid = call->request->pid;
+    const uint64_t *args = call->args;
+    const pid_t pid = call->pid;
     const char *path0 = call->paths[0].host;
     const char *path1 = call->paths[1].host;
-    uint8_t buffer[STATX_BUFFER_SIZE > sizeof(struct stat)
-		   ? STATX_BUFFER_SIZE : sizeof(struct stat)];
     struct timespec times[2];
-    size_t buffer_size = 0;
-    word_t buffer_address = 0;
     mode_t mode;
     long result;
     int status;
@@ -1190,23 +1279,20 @@ static Action perform(int listener, Call *call, const char *target,
     case PR_lstat:
 	result = syscall(SYS_newfstatat, AT_FDCWD, path0, buffer,
 			 call->sysnum == PR_lstat ? AT_SYMLINK_NOFOLLOW : 0);
-	buffer_size = sizeof(struct stat);
-	buffer_address = args[1];
+	call->data_size = sizeof(struct stat);
 	break;
 
     case PR_newfstatat:
 	result = syscall(SYS_newfstatat, AT_FDCWD, path0, buffer,
 			 call->flags);
-	buffer_size = sizeof(struct stat);
-	buffer_address = args[2];
+	call->data_size = sizeof(struct stat);
 	break;
 
 #if defined(SYS_statx)
     case PR_statx:
 	result = syscall(SYS_statx, AT_FDCWD, path0, call->flags,
 			 (unsigned int) args[3], buffer);
-	buffer_size = STATX_BUFFER_SIZE;
-	buffer_address = args[4];
+	call->data_size = STATX_BUFFER_SIZE;
 	break;
 #endif
 
@@ -1234,7 +1320,7 @@ static Action perform(int listener, Call *call, const char *target,
 	    mode &= ~get_umask(call);
 	else
 	    mode = 0;
-	return open_file(listener, call, mode, response);
+	return open_file(listener, call, mode);
 #endif
 
     case PR_mkdir:
@@ -1309,7 +1395,7 @@ static Action perform(int listener, Call *call, const char *target,
 	if (args[2] != 0) {
 	    status = read_remote_data(pid, args[2], times, sizeof(times));
 	    if (status < 0) {
-		response->error = status;
+		call->result = status;
 		return REPLY;
 	    }
 	}
@@ -1322,24 +1408,18 @@ static Action perform(int listener, Call *call, const char *target,
 	break;
 
     default:
-	response->error = -ENOSYS;
-	return REPLY;
+	/* Not emulated by an extension (routed_emulated_sysnums).  */
+	return CONTINUE;
     }
 
     if (result < 0) {
-	response->error = -errno;
+	call->result = -errno;
+	call->data_size = 0;
 	return REPLY;
     }
 
-    if (buffer_size != 0) {
-	status = write_remote_data(pid, buffer_address, buffer, buffer_size);
-	if (status < 0) {
-	    response->error = status;
-	    return REPLY;
-	}
-    }
-
-    response->val = result;
+    call->result = result;
+    call->data = (call->data_size != 0 ? buffer : NULL);
     return REPLY;
 }
 
@@ -1348,13 +1428,13 @@ static Action perform(int listener, Call *call, const char *target,
  * @call->paths[0].host to @call->paths[1].host, as the ptrace flow
  * does at the exit stage.
  */
-static void update_cwd(const Call *call)
+static void update_cwd(const NotifiedCall *call)
 {
     char old_path[PATH_MAX];
     char new_path[PATH_MAX];
     Tracee *tracee;
 
-    tracee = lock_tracee(call->request->pid, true);
+    tracee = lock_tracee(call->pid, true);
     if (tracee == NULL)
 	return;
 
@@ -1366,6 +1446,174 @@ static void update_cwd(const Call *call)
 }
 
 /**
+ * Read the arguments of @call from the memory of the tracee and check
+ * them like the kernel would do before anything else.  This function
+ * returns REPLY with @call->result set if the syscall fails or REPLY
+ * with @call->result = 0 if it has to be served, CONTINUE if the
+ * kernel can perform it as-is.
+ */
+static Action read_arguments(NotifiedCall *call, char target[PATH_MAX])
+{
+    int status;
+    size_t i;
+
+    for (i = 0; i < call->nb_paths; i++) {
+	NotifiedPath *path = &call->paths[i];
+
+	if (path->address == 0) {
+	    /* No path, nothing to translate: the syscall applies
+	     * to the tracee's descriptor (AT_EMPTY_PATH) or fails
+	     * by itself.  */
+	    if (call->nb_paths == 1)
+		return CONTINUE;
+
+	    call->result = -EFAULT;
+	    return REPLY;
+	}
+
+	status = read_remote_path(call->pid, path->address, path->user);
+	if (status < 0) {
+	    call->result = status;
+	    return REPLY;
+	}
+    }
+
+    if (call->nb_paths == 1 && call->paths[0].user[0] == '\0')
+	return CONTINUE;
+
+    /* The target of a symlink is stored as-is.  */
+    if (call->sysnum == PR_symlink || call->sysnum == PR_symlinkat) {
+	status = read_remote_path(call->pid, call->args[0], target);
+	if (status < 0) {
+	    call->result = status;
+	    return REPLY;
+	}
+	if (target[0] == '\0') {
+	    call->result = -ENOENT;
+	    return REPLY;
+	}
+    }
+
+    /* Only linkat(2) accepts an empty path along with another
+     * one.  */
+    if (call->nb_paths == 2
+	&& (call->paths[1].user[0] == '\0'
+	    || (call->paths[0].user[0] == '\0'
+		&& (call->sysnum != PR_linkat
+		    || (call->flags & AT_EMPTY_PATH) == 0)))) {
+	call->result = -ENOENT;
+	return REPLY;
+    }
+
+    /* Checked by the kernel before anything else.  */
+    if ((call->sysnum == PR_readlink && (int) call->args[2] <= 0)
+	|| (call->sysnum == PR_readlinkat && (int) call->args[3] <= 0)) {
+	call->result = -EINVAL;
+	return REPLY;
+    }
+
+    return REPLY;
+}
+
+/**
+ * Handle the syscall described by @call on behalf of the tracee.
+ * This function returns REPLY with @call->result set, DROP if the
+ * notification was answered already, or CONTINUE.
+ */
+static Action handle_call(int listener, NotifiedCall *call)
+{
+    uint8_t buffer[STATX_BUFFER_SIZE > sizeof(struct stat)
+		   ? STATX_BUFFER_SIZE : sizeof(struct stat)];
+    const struct seccomp_notif *request = call->request;
+    char target[PATH_MAX];
+    bool extensions;
+    Tracee *tracee = NULL;
+    Action action;
+    int status;
+
+    if (notify_take_note(call))
+	return CONTINUE;
+
+    /* Not reachable unless the filter and the decoder disagree.  */
+    if (!decode(call))
+	return CONTINUE;
+
+    action = read_arguments(call, target);
+    if (action != REPLY || call->result != 0)
+	return action;
+
+    /* Redirecting the tracee's own auxv modifies it.  */
+    call->exclusive = (is_open(call->sysnum)
+		       && strncmp(call->paths[0].user, "/proc/",
+				  strlen("/proc/")) == 0);
+
+    /* Make sure @call->pid still designates the tracee that made
+     * this syscall, rather than a process that reused its pid.  */
+    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &request->id) < 0)
+	return DROP;
+
+    action = translate(call, &tracee);
+    if (action != REPLY || call->result != 0)
+	return action;
+
+    /* The target has to be detranslated with the big lock held.  */
+    if (call->sysnum == PR_readlink || call->sysnum == PR_readlinkat) {
+	emulate_readlink(tracee, call, call->paths[0].host,
+			 call->args[call->sysnum == PR_readlink ? 1 : 2],
+			 (int) call->args[call->sysnum == PR_readlink ? 2 : 3]);
+	restore_modes(call);
+	current_call = NULL;
+	unlock();
+	return REPLY;
+    }
+
+    /* Extensions use the tracee, which has to stay locked until
+     * they are done.  */
+    extensions = has_extensions(tracee);
+    if (!extensions) {
+	current_call = NULL;
+	unlock();
+    }
+
+    status = (extensions
+	      ? notify_extensions(tracee, NOTIFY_ENTER, (intptr_t) call, 0)
+	      : 0);
+    if (status < 0)
+	call->result = status;
+    else if (status == 0)
+	action = perform(listener, call, target, buffer);
+
+    if (status >= 0 && action == REPLY && extensions)
+	(void) notify_extensions(tracee, NOTIFY_EXIT, (intptr_t) call, 0);
+
+    if (extensions) {
+	restore_modes(call);
+	current_call = NULL;
+	unlock();
+    }
+
+    if (action != REPLY)
+	return action;
+
+    if (call->result >= 0 && call->data != NULL) {
+	status = write_remote_data(call->pid, call->sysnum == PR_statx
+				   ? call->args[4]
+				   : call->args[call->sysnum == PR_newfstatat
+						? 2 : 1], call->data,
+				   call->data_size);
+	if (status < 0)
+	    call->result = status;
+    }
+
+    if (call->result >= 0
+	&& (call->sysnum == PR_rename || call->sysnum == PR_renameat
+	    || call->sysnum == PR_renameat2))
+	update_cwd(call);
+
+    return REPLY;
+}
+
+/**
  * Handle the syscall described by @request on behalf of the tracee
  * and fill @response accordingly.
  */
@@ -1374,118 +1622,35 @@ static Action handle_request(int listener,
 			     struct seccomp_notif_resp *response)
 {
     static SeccompArch seccomp_archs[] = SECCOMP_ARCHS;
-    char target[PATH_MAX];
-    Tracee *tracee = NULL;
+    NotifiedCall *call;
     Action action;
-    Call call;
-    int status;
     size_t i;
 
-    memset(&call, 0, sizeof(call));
-    call.request = request;
-    call.args = request->data.args;
-    call.sysnum = PR_void;
-
-    if (request->data.arch == seccomp_archs[0].value)
-	call.sysnum = find_routed_sysnum(request->data.nr);
-
-    if (notify_take_note(&call))
-	return CONTINUE;
-
-    decode(&call);
-
-    /* Not reachable unless the filter and the decoder disagree.  */
-    if (call.nb_paths == 0)
-	return CONTINUE;
-
-    for (i = 0; i < call.nb_paths; i++) {
-	PathArg *path = &call.paths[i];
-
-	if (path->address == 0) {
-	    /* No path, nothing to translate: the syscall applies
-	     * to the tracee's descriptor (AT_EMPTY_PATH) or fails
-	     * by itself.  */
-	    if (call.nb_paths == 1)
-		return CONTINUE;
-
-	    response->error = -EFAULT;
-	    return REPLY;
-	}
-
-	status = read_remote_path(request->pid, path->address, path->user);
-	if (status < 0) {
-	    response->error = status;
-	    return REPLY;
-	}
-    }
-
-    if (call.nb_paths == 1 && call.paths[0].user[0] == '\0')
-	return CONTINUE;
-
-    /* The target of a symlink is stored as-is.  */
-    if (call.sysnum == PR_symlink || call.sysnum == PR_symlinkat) {
-	status = read_remote_path(request->pid, call.args[0], target);
-	if (status < 0) {
-	    response->error = status;
-	    return REPLY;
-	}
-	if (target[0] == '\0') {
-	    response->error = -ENOENT;
-	    return REPLY;
-	}
-    }
-
-    /* Only linkat(2) accepts an empty path along with another
-     * one.  */
-    if (call.nb_paths == 2
-	&& (call.paths[1].user[0] == '\0'
-	    || (call.paths[0].user[0] == '\0'
-		&& (call.sysnum != PR_linkat
-		    || (call.flags & AT_EMPTY_PATH) == 0)))) {
-	response->error = -ENOENT;
+    /* About 9 KB, too much for the stack of some threads.  */
+    call = calloc(1, sizeof(NotifiedCall));
+    if (call == NULL) {
+	response->error = -ENOMEM;
 	return REPLY;
     }
 
-    /* Checked by the kernel before anything else.  */
-    if ((call.sysnum == PR_readlink && (int) call.args[2] <= 0)
-	|| (call.sysnum == PR_readlinkat && (int) call.args[3] <= 0)) {
-	response->error = -EINVAL;
-	return REPLY;
+    call->request = request;
+    call->pid = request->pid;
+    for (i = 0; i < 6; i++)
+	call->args[i] = request->data.args[i];
+
+    call->sysnum = (request->data.arch == seccomp_archs[0].value
+		    ? find_routed_sysnum(request->data.nr) : PR_void);
+
+    action = handle_call(listener, call);
+
+    if (action == REPLY) {
+	if (call->result < 0)
+	    response->error = call->result;
+	else
+	    response->val = call->result;
     }
 
-    /* Redirecting the tracee's own auxv modifies it.  */
-    call.exclusive = (is_open(call.sysnum)
-		      && strncmp(call.paths[0].user, "/proc/",
-				 strlen("/proc/")) == 0);
-
-    /* Make sure @request->pid still designates the tracee that made
-     * this syscall, rather than a process that reused its pid.  */
-    if (ioctl(listener, SECCOMP_IOCTL_NOTIF_ID_VALID, &request->id) < 0)
-	return DROP;
-
-    action = translate(&call, response, &tracee);
-    if (action != REPLY || response->error != 0)
-	return action;
-
-    /* The target has to be detranslated with the big lock held.  */
-    if (call.sysnum == PR_readlink || call.sysnum == PR_readlinkat) {
-	emulate_readlink(tracee, request, call.paths[0].host,
-			 call.args[call.sysnum == PR_readlink ? 1 : 2],
-			 (int) call.args[call.sysnum == PR_readlink ? 2 : 3],
-			 response);
-	unlock();
-	return REPLY;
-    }
-
-    unlock();
-
-    action = perform(listener, &call, target, response);
-
-    if (action == REPLY && response->error == 0
-	&& (call.sysnum == PR_rename || call.sysnum == PR_renameat
-	    || call.sysnum == PR_renameat2))
-	update_cwd(&call);
-
+    free(call);
     return action;
 }
 
@@ -1631,6 +1796,7 @@ void notify_start(int socket)
 #else				/* !defined(NOTIFY_SUPPORTED) */
 
 #include <unistd.h>		/* close(2), */
+#include <errno.h>		/* E*, */
 
 #include "attribute.h"
 
@@ -1664,6 +1830,23 @@ void notify_send_listener(int socket, int listener)
 void notify_start(int socket)
 {
     (void) close(socket);
+}
+
+NotifiedCall *notify_current_call(void)
+{
+    return NULL;
+}
+
+int notify_defer_mode(NotifiedCall *call UNUSED, const char *path UNUSED,
+		      mode_t mode UNUSED)
+{
+    return -ENOSYS;
+}
+
+int notify_write_memory(pid_t pid UNUSED, word_t address UNUSED,
+			const void *data UNUSED, size_t size UNUSED)
+{
+    return -ENOSYS;
 }
 
 #endif				/* defined(NOTIFY_SUPPORTED) */

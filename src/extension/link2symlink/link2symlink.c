@@ -8,8 +8,15 @@
 #include <sys/stat.h>		/* lstat(2), */
 #include <errno.h>		/* E*, */
 #include <limits.h>		/* PATH_MAX, */
+#include <fcntl.h>		/* AT_*, */
+#include <stdbool.h>		/* bool, */
+#include <stdint.h>		/* uint*_t, */
+#include <pthread.h>		/* pthread_mutex_*, */
+#include <sys/syscall.h>	/* SYS_statx, */
 
+#include "build.h"
 #include "extension/extension.h"
+#include "syscall/notify.h"
 #include "tracee/tracee.h"
 #include "tracee/mem.h"
 #include "syscall/syscall.h"
@@ -19,6 +26,9 @@
 #include "attribute.h"
 
 #define PREFIX ".l2s."
+
+/* Size in bytes of the kernel's struct statx.  */
+#define STATX_STRUCT_SIZE 256
 #define DELETED_SUFFIX " (deleted)"
 
 /**
@@ -40,15 +50,13 @@ static int my_readlink(const char symlink[PATH_MAX], char value[PATH_MAX])
 }
 
 /**
- * Move the path pointed to by @tracee's @sysarg to a new location,
- * symlink the original path to this new one, make @tracee's @sysarg
- * point to the new location.  This function returns -errno if an
- * error occured, otherwise 0.
+ * Move the host path @original to a new location, symlink @original
+ * to this new one, put this new location in @intermediate.  This
+ * function returns -errno if an error occured, otherwise 0.
  */
-static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
+static int move_and_symlink(const char original[PATH_MAX],
+			    char intermediate[PATH_MAX])
 {
-    char original[PATH_MAX];
-    char intermediate[PATH_MAX];
     char new_intermediate[PATH_MAX];
     char final[PATH_MAX];
     char new_final[PATH_MAX];
@@ -60,19 +68,10 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
     int first_link = 1;
     int intermediate_suffix = 1;
 
-    /* Note: this path was already canonicalized.  */
-    size =
-	read_string(tracee, original,
-		    peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
-    if (size < 0)
-	return size;
-    if (size >= PATH_MAX)
-	return -ENAMETOOLONG;
-
     /* Sanity check: directories can't be linked.  */
     status = lstat(original, &statl);
     if (status < 0)
-	return status;
+	return -errno;
     if (S_ISDIR(statl.st_mode))
 	return -EPERM;
 
@@ -98,7 +97,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
 
 	name = strrchr(original, '/');
 	if (name == NULL)
-	    name = original;
+	    name = (char *) original;
 	else
 	    name++;
 
@@ -122,17 +121,17 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
 	strcat(final, ".0002");
 	status = rename(original, final);
 	if (status < 0)
-	    return status;
+	    return -errno;
 
 	/* Symlink the intermediate to the final file.  */
 	status = symlink(final, intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
 
 	/* Symlink the original path to the intermediate one.  */
 	status = symlink(intermediate, original);
 	if (status < 0)
-	    return status;
+	    return -errno;
     } else {
 	/*
 	 * Move the original content to new location, by incrementing
@@ -150,16 +149,45 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
 
 	status = rename(final, new_final);
 	if (status < 0)
-	    return status;
+	    return -errno;
 	strcpy(final, new_final);
 	/* Symlink the intermediate to the final file.  */
 	status = unlink(intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
 	status = symlink(final, intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
     }
+
+    return 0;
+}
+
+/**
+ * Move the path pointed to by @tracee's @sysarg to a new location,
+ * symlink the original path to this new one, make @tracee's @sysarg
+ * point to the new location.  This function returns -errno if an
+ * error occured, otherwise 0.
+ */
+static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
+{
+    char original[PATH_MAX];
+    char intermediate[PATH_MAX];
+    ssize_t size;
+    int status;
+
+    /* Note: this path was already canonicalized.  */
+    size =
+	read_string(tracee, original,
+		    peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
+    if (size < 0)
+	return size;
+    if (size >= PATH_MAX)
+	return -ENAMETOOLONG;
+
+    status = move_and_symlink(original, intermediate);
+    if (status < 0)
+	return status;
 
     status = set_sysarg_path(tracee, intermediate, sysarg);
     if (status < 0)
@@ -174,9 +202,8 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg)
  * let the file be deleted, but also delete the symlink that was created and
  * decremnt the count that is tacked to end of original file.
  */
-static int decrement_link_count(Tracee *tracee, Reg sysarg)
+static int decrement_link_count2(const char original[PATH_MAX])
 {
-    char original[PATH_MAX];
     char intermediate[PATH_MAX];
     char final[PATH_MAX];
     char new_final[PATH_MAX];
@@ -185,15 +212,6 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
     ssize_t size;
     int status;
     int link_count;
-
-    /* Note: this path was already canonicalized.  */
-    size =
-	read_string(tracee, original,
-		    peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
-    if (size < 0)
-	return size;
-    if (size >= PATH_MAX)
-	return -ENAMETOOLONG;
 
     /* Check if it is a converted link already.  */
     status = lstat(original, &statl);
@@ -231,29 +249,146 @@ static int decrement_link_count(Tracee *tracee, Reg sysarg)
 
 	status = rename(final, new_final);
 	if (status < 0)
-	    return status;
+	    return -errno;
 
 	strcpy(final, new_final);
 
 	/* Symlink the intermediate to the final file.  */
 	status = unlink(intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
 
 	status = symlink(final, intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
     } else {
 	/* If it is the last, delete the intermediate and final */
 	status = unlink(intermediate);
 	if (status < 0)
-	    return status;
+	    return -errno;
 	status = unlink(final);
 	if (status < 0)
-	    return status;
+	    return -errno;
     }
 
     return 0;
+}
+
+/**
+ * Same as decrement_link_count2() for the path pointed to by
+ * @tracee's @sysarg.
+ */
+static int decrement_link_count(Tracee *tracee, Reg sysarg)
+{
+    char original[PATH_MAX];
+    ssize_t size;
+
+    /* Note: this path was already canonicalized.  */
+    size =
+	read_string(tracee, original,
+		    peek_reg(tracee, CURRENT, sysarg), PATH_MAX);
+    if (size < 0)
+	return size;
+    if (size >= PATH_MAX)
+	return -ENAMETOOLONG;
+
+    return decrement_link_count2(original);
+}
+
+/**
+ * Check whether the host path @original is a fake hard link, or one
+ * of its internal files.  This function puts in @final the path of
+ * the file it stands for and returns its number of links, or returns
+ * 0 if @original is not a fake hard link, or -errno if an error
+ * occured.
+ */
+static int get_fake_link(const char original[PATH_MAX],
+			 char final[PATH_MAX])
+{
+    char intermediate[PATH_MAX];
+    struct stat statl;
+    const char *name;
+    ssize_t size;
+
+    name = strrchr(original, '/');
+    if (name == NULL)
+	name = original;
+    else
+	name++;
+
+    /* Check if it is a link */
+    statl.st_mode = 0;
+    (void) lstat(original, &statl);
+
+    if (strncmp(name, PREFIX, strlen(PREFIX)) == 0) {
+	if (S_ISLNK(statl.st_mode)) {
+	    strcpy(intermediate, original);
+	    goto intermediate_proc;
+	} else {
+	    strcpy(final, original);
+	    goto final_proc;
+	}
+    }
+
+    if (!S_ISLNK(statl.st_mode))
+	return 0;
+
+    size = my_readlink(original, intermediate);
+    if (size < 0)
+	return size;
+
+    name = strrchr(intermediate, '/');
+    if (name == NULL)
+	name = intermediate;
+    else
+	name++;
+
+    if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
+	return 0;
+
+  intermediate_proc:
+    size = my_readlink(intermediate, final);
+    if (size < 0)
+	return size;
+
+  final_proc:
+    if (strlen(final) < 4)
+	return 0;
+
+    return atoi(final + strlen(final) - 4);
+}
+
+/**
+ * Put in @buffer the status of the file @final stands for, with
+ * @nb_links links: a struct statx if @is_statx (with the given
+ * @mask), otherwise a struct stat.  This function returns the size
+ * of the status, or -errno if an error occured.
+ */
+static ssize_t get_fake_link_status(const char final[PATH_MAX],
+				    int nb_links, bool is_statx,
+				    unsigned int mask, uint8_t *buffer)
+{
+    struct stat *final_stat = (struct stat *) buffer;
+    uint32_t nlink = nb_links;
+
+    if (is_statx) {
+#if defined(SYS_statx)
+	if (syscall(SYS_statx, AT_FDCWD, final, AT_SYMLINK_NOFOLLOW, mask,
+		    buffer) < 0)
+	    return -errno;
+
+	memcpy(buffer + OFFSETOF_STATX_NLINK, &nlink, sizeof(nlink));
+	return STATX_STRUCT_SIZE;
+#else
+	return -ENOSYS;
+#endif
+    }
+
+    if (lstat(final, final_stat) < 0)
+	return -errno;
+
+    final_stat->st_nlink = nb_links;
+    return sizeof(struct stat);
 }
 
 /**
@@ -286,17 +421,16 @@ static int handle_sysexit_end(Tracee *tracee)
 	//int lstat(const char *path, struct stat *buf);
     case PR_fstat:{
 	    //int fstat(int fd, struct stat *buf);
+	    uint8_t buffer[STATX_STRUCT_SIZE > sizeof(struct stat)
+			   ? STATX_STRUCT_SIZE : sizeof(struct stat)];
 	    word_t result;
 	    Reg sysarg_stat;
 	    Reg sysarg_path;
 	    int status;
-	    struct stat statl;
 	    ssize_t size;
 	    char original[PATH_MAX];
-	    char intermediate[PATH_MAX];
 	    char final[PATH_MAX];
-	    char *name;
-	    struct stat finalStat;
+	    int nb_links;
 
 	    /* Override only if it succeed.  */
 	    result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
@@ -309,13 +443,14 @@ static int handle_sysexit_end(Tracee *tracee)
 					 peek_reg(tracee,
 						  MODIFIED,
 						  SYSARG_1), original);
-		if (strcmp
+		if (status < 0)
+		    return status;
+		if (strlen(original) >= strlen(DELETED_SUFFIX)
+		    && strcmp
 		    (original + strlen(original) -
 		     strlen(DELETED_SUFFIX), DELETED_SUFFIX) == 0)
 		    original[strlen(original) -
 			     strlen(DELETED_SUFFIX)] = '\0';
-		if (status < 0)
-		    return status;
 	    } else {
 		if (sysnum == PR_fstatat64
 		    || sysnum == PR_newfstatat || sysnum == PR_statx)
@@ -332,52 +467,15 @@ static int handle_sysexit_end(Tracee *tracee)
 		    return -ENAMETOOLONG;
 	    }
 
-	    name = strrchr(original, '/');
-	    if (name == NULL)
-		name = original;
-	    else
-		name++;
+	    nb_links = get_fake_link(original, final);
+	    if (nb_links <= 0)
+		return nb_links;
 
-	    /* Check if it is a link */
-	    status = lstat(original, &statl);
-
-	    if (strncmp(name, PREFIX, strlen(PREFIX)) == 0) {
-		if (S_ISLNK(statl.st_mode)) {
-		    strcpy(intermediate, original);
-		    goto intermediate_proc;
-		} else {
-		    strcpy(final, original);
-		    goto final_proc;
-		}
-	    }
-
-	    if (!S_ISLNK(statl.st_mode))
-		return 0;
-
-	    size = my_readlink(original, intermediate);
+	    size = get_fake_link_status(final, nb_links, sysnum == PR_statx,
+					peek_reg(tracee, ORIGINAL, SYSARG_4),
+					buffer);
 	    if (size < 0)
 		return size;
-
-	    name = strrchr(intermediate, '/');
-	    if (name == NULL)
-		name = intermediate;
-	    else
-		name++;
-
-	    if (strncmp(name, PREFIX, strlen(PREFIX)) != 0)
-		return 0;
-
-	  intermediate_proc:
-	    size = my_readlink(intermediate, final);
-	    if (size < 0)
-		return size;
-
-	  final_proc:
-	    status = lstat(final, &finalStat);
-	    if (status < 0)
-		return status;
-
-	    finalStat.st_nlink = atoi(final + strlen(final) - 4);
 
 	    /* Get the address of the 'stat' structure.  */
 	    if (sysnum == PR_fstatat64 || sysnum == PR_newfstatat)
@@ -390,8 +488,7 @@ static int handle_sysexit_end(Tracee *tracee)
 	    status =
 		write_data(tracee,
 			   peek_reg(tracee, ORIGINAL,
-				    sysarg_stat), &finalStat,
-			   sizeof(finalStat));
+				    sysarg_stat), buffer, size);
 	    if (status < 0)
 		return status;
 
@@ -400,6 +497,150 @@ static int handle_sysexit_end(Tracee *tracee)
 
     default:
 	return 0;
+    }
+}
+
+/* Fake hard links are made of several files that only one worker at a
+ * time can update, see handle_notify_enter().  */
+static pthread_mutex_t notify_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Check whether the syscall @sysnum can be served by a seccomp
+ * notification worker, see handle_notify_enter() and
+ * handle_notify_exit().
+ */
+static bool is_notified_syscall(Sysnum sysnum)
+{
+    switch (sysnum) {
+    case PR_link:
+    case PR_linkat:
+    case PR_unlink:
+    case PR_unlinkat:
+    case PR_rename:
+    case PR_renameat:
+    case PR_lstat:
+    case PR_newfstatat:
+    case PR_stat:
+    case PR_statx:
+	return true;
+
+    case PR_fstat:
+    case PR_fstat64:
+    case PR_fstatat64:
+    case PR_lstat64:
+    case PR_stat64:
+	return false;
+
+    default:
+	/* Syscalls this extension doesn't handle are fine.  */
+	return true;
+    }
+}
+
+/**
+ * Translate again the path number @index of @call for @tracee: the
+ * fake hard link it refers to might have been converted by another
+ * worker since it was translated (see translated_path()).  The caller
+ * holds notify_mutex.  This function returns -errno if an error
+ * occurred, otherwise 0.
+ */
+static int retranslate(Tracee *tracee, NotifiedCall *call, size_t index)
+{
+    NotifiedPath *path = &call->paths[index];
+
+    if (path->user[0] == '\0')
+	return 0;
+
+    return translate_path(tracee, path->host, path->dirfd, path->user,
+			  path->deref_final);
+}
+
+/**
+ * Adjust the syscall @call a worker is about to perform on behalf of
+ * @tracee, like the SYSCALL_ENTER_END stage does in the ptrace flow.
+ * This function returns > 0 if the syscall is emulated, -errno if an
+ * error occurred, otherwise 0.
+ */
+static int handle_notify_enter(Tracee *tracee, NotifiedCall *call)
+{
+    char intermediate[PATH_MAX];
+    size_t index;
+    int status;
+
+    switch (call->sysnum) {
+    case PR_rename:
+    case PR_renameat:
+    case PR_unlink:
+    case PR_unlinkat:
+	/* If the path being removed, or replaced (newpath), is a
+	 * pseudo hard link, decrement the link count.  */
+	index = ((call->sysnum == PR_rename
+		  || call->sysnum == PR_renameat) ? 1 : 0);
+
+	(void) pthread_mutex_lock(&notify_mutex);
+	status = retranslate(tracee, call, index);
+	if (status >= 0)
+	    status = decrement_link_count2(call->paths[index].host);
+	(void) pthread_mutex_unlock(&notify_mutex);
+	return (status < 0 ? status : 0);
+
+    case PR_link:
+    case PR_linkat:
+	/* Convert link(oldpath, newpath) into symlink(intermediate,
+	 * newpath).  */
+	(void) pthread_mutex_lock(&notify_mutex);
+	status = retranslate(tracee, call, 0);
+	if (status >= 0)
+	    status = retranslate(tracee, call, 1);
+	if (status >= 0)
+	    status = move_and_symlink(call->paths[0].host, intermediate);
+	if (status >= 0)
+	    status = (symlink(intermediate, call->paths[1].host) < 0
+		      ? -errno : 0);
+	(void) pthread_mutex_unlock(&notify_mutex);
+
+	call->result = status;
+	return 1;
+
+    default:
+	return 0;
+    }
+}
+
+/**
+ * Adjust the result of the syscall @call a worker has performed on
+ * behalf of the tracee, like handle_sysexit_end() does in the ptrace
+ * flow.
+ */
+static void handle_notify_exit(NotifiedCall *call)
+{
+    char final[PATH_MAX];
+    ssize_t size;
+    int nb_links;
+
+    switch (call->sysnum) {
+    case PR_stat:
+    case PR_lstat:
+    case PR_newfstatat:
+    case PR_statx:
+	/* Override only if it succeed.  */
+	if (call->result != 0 || call->data == NULL)
+	    return;
+
+	nb_links = get_fake_link(call->paths[0].host, final);
+	if (nb_links <= 0)
+	    return;
+
+	size = get_fake_link_status(final, nb_links,
+				    call->sysnum == PR_statx,
+				    (unsigned int) call->args[3],
+				    call->data);
+	if (size < 0)
+	    call->result = size;
+	return;
+
+    default:
+	return;
     }
 }
 
@@ -618,6 +859,17 @@ link2symlink_callback(Extension *extension, ExtensionEvent event,
     case SYSCALL_EXIT_END:{
 	    return handle_sysexit_end(TRACEE(extension));
 	}
+
+    case NOTIFIED_SYSCALL:
+	return (is_notified_syscall((Sysnum) data1) ? 1 : 0);
+
+    case NOTIFY_ENTER:
+	return handle_notify_enter(TRACEE(extension),
+				   (NotifiedCall *) data1);
+
+    case NOTIFY_EXIT:
+	handle_notify_exit((NotifiedCall *) data1);
+	return 0;
 
     case TRANSLATED_PATH:
 	translated_path((char *) data1);
