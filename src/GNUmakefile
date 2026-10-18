@@ -168,11 +168,11 @@ GIT_COMMIT := $(shell git rev-parse --short=8 HEAD 2>/dev/null)
 VERSION = $(if $(or $(GIT_VERSION),$(GIT_COMMIT)),$(GIT_VERSION)-$(GIT_COMMIT))
 
 CHECK_VERSION = if [ ! -z "$(VERSION)" ]; \
-                then /bin/echo -e "\#undef VERSION\n\#define VERSION \"$(VERSION)\""; \
+                then printf "\#undef VERSION\n\#define VERSION \"%s\"\n" "$(VERSION)"; \
                 fi;
 
 ifneq ($(and $(HAS_SWIG),$(HAS_PYTHON_CONFIG)),)
-	CHECK_PYTHON_EXTENSION = /bin/echo -e "\#define HAVE_PYTHON_EXTENSION"
+	CHECK_PYTHON_EXTENSION = printf "\#define HAVE_PYTHON_EXTENSION\n"
 endif
 
 CHECK_FEATURES = process_vm seccomp_filter
